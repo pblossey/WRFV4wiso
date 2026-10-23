@@ -8,7 +8,7 @@ MODULE module_first_rk_step_part2
 CONTAINS
 
   SUBROUTINE first_rk_step_part2 (   grid , config_flags              &
-                             , moist , moist_tend               &
+                             , moist , moist_old , moist_tend   &
                              , chem  , chem_tend                &
                              , tracer, tracer_tend              &
                              , scalar , scalar_tend             &
@@ -18,7 +18,7 @@ CONTAINS
                              , ph_tendf, mu_tendf               &
                              , tke_tend                         &
                              , adapt_step_flag , curr_secs      &
-                             , psim , psih , wspd , gz1oz0 , chklowq &
+                             , psim , psih , gz1oz0 , chklowq   &
                              , cu_act_flag , hol , th_phy        &
                              , pi_phy , p_phy , t_phy     &
                              , dz8w , p8w , t8w           &
@@ -37,6 +37,7 @@ CONTAINS
     USE module_model_constants
     USE module_domain, ONLY : domain
     USE module_configure, ONLY : grid_config_rec_type, model_config_rec
+    USE module_big_step_utilities_em, ONLY : conv_t_tendf_to_moist
 #ifdef DM_PARALLEL
     USE module_dm, ONLY : local_communicator, mytask, ntasks, ntasks_x, ntasks_y, local_communicator_periodic, &
                           wrf_dm_maxval, wrf_err_message, local_communicator_x, local_communicator_y
@@ -50,14 +51,16 @@ CONTAINS
     USE module_driver_constants
     USE module_diffusion_em, ONLY : phy_bc, cal_deform_and_div, compute_diff_metrics, &
                                     vertical_diffusion_2, horizontal_diffusion_2, calculate_km_kh, &
-                                    tke_rhs, cal_helicity
+                                    tke_rhs, cal_helicity, &
+                                    nonlocal_flux,meso_length_scale,free_atmos_length, &
+                                    vertical_diffusion_implicit !XZ 
     USE module_em, ONLY : calculate_phy_tend
     USE module_fddaobs_driver, ONLY : fddaobs_driver
     USE module_bc, ONLY : set_physical_bc3d, set_physical_bc2d
     USE module_physics_addtendc, ONLY : update_phy_ten
 
     USE module_sfs_driver !JDM
-    USE module_stoch, ONLY : update_stoch_ten, perturb_physics_tend,RAND_PERT_UPDATE
+    USE module_stoch, ONLY : update_stoch_ten, perturb_physics_tend, RAND_PERT_UPDATE, contiguize_2d
 
     USE MODULE_WRF_ERROR !bloss/wiso: allows optional output of max/min check on blten
 
@@ -81,6 +84,7 @@ CONTAINS
     REAL, INTENT(IN)                           :: curr_secs
 
     REAL    ,DIMENSION(ims:ime,kms:kme,jms:jme,num_moist),INTENT(INOUT)   :: moist
+    REAL    ,DIMENSION(ims:ime,kms:kme,jms:jme,num_moist),INTENT(IN)      :: moist_old
     REAL    ,DIMENSION(ims:ime,kms:kme,jms:jme,num_moist),INTENT(INOUT)   :: moist_tend
     REAL    ,DIMENSION(ims:ime,kms:kme,jms:jme,num_chem),INTENT(INOUT)   :: chem
     REAL    ,DIMENSION(ims:ime,kms:kme,jms:jme,num_chem),INTENT(INOUT)   :: chem_tend
@@ -92,7 +96,6 @@ CONTAINS
     REAL    ,DIMENSION(ims:ime,1:1,jms:jme,num_fdda2d),INTENT(INOUT)      :: fdda2d
     REAL    ,DIMENSION(ims:ime,jms:jme), INTENT(INOUT)         :: psim
     REAL    ,DIMENSION(ims:ime,jms:jme), INTENT(INOUT)         :: psih
-    REAL    ,DIMENSION(ims:ime,jms:jme), INTENT(INOUT)         :: wspd
     REAL    ,DIMENSION(ims:ime,jms:jme), INTENT(INOUT)         :: gz1oz0
     REAL    ,DIMENSION(ims:ime,jms:jme), INTENT(INOUT)         :: chklowq
     LOGICAL ,DIMENSION(ims:ime,jms:jme), INTENT(INOUT)         :: cu_act_flag
@@ -137,10 +140,14 @@ CONTAINS
     INTEGER  num_road_layers
     INTEGER  iswater
     INTEGER  rk_step 
+    INTEGER  n
+    LOGICAL :: stepsp_test
 
 #if ( WRF_DFI_RADAR == 1 )
     INTEGER  i_start,i_end,j_start,j_end,i,j,k
 #endif
+
+    REAL, DIMENSION(ims:ime,jms:jme) :: SPFORCS3d_loc, SPFORCC3d_loc, SP_AMP3d_loc
 
  ! initialize all tendencies to zero in order to update physics
  ! tendencies first (separate from dry dynamics).
@@ -163,6 +170,7 @@ CONTAINS
                           grid%num_stoch_levels,grid%num_stoch_levels,        &
                           grid%num_stoch_levels,grid%num_stoch_levels,        &
                           config_flags%restart, grid%iseedarr_skebs,          &
+                          config_flags%seed_dim,                              &
                           grid%DX,grid%DY,grid%skebs_vertstruc,               &
                           grid%rt_tendf_stoch,                                &
                           grid%stddev_cutoff_sppt,grid%gridpt_stddev_sppt, & 
@@ -182,6 +190,7 @@ CONTAINS
                            grid% num_stoch_levels,grid% num_stoch_levels,     &
                            grid% num_stoch_levels,grid% num_stoch_levels,     &
                            config_flags%restart, grid%iseedarr_skebs,         &
+                           config_flags%seed_dim,                             &
                            grid%DX,grid%DY,grid%skebs_vertstruc,              &
                            grid%ru_tendf_stoch,                               &
                            grid%stddev_cutoff_sppt,grid%gridpt_stddev_sppt, & 
@@ -201,6 +210,7 @@ CONTAINS
                            grid% num_stoch_levels,grid% num_stoch_levels,     &
                            grid% num_stoch_levels,grid% num_stoch_levels,     &
                            config_flags%restart, grid%iseedarr_skebs,         &
+                           config_flags%seed_dim,                             &
                            grid%DX,grid%DY,grid%skebs_vertstruc,              &
                            grid%rv_tendf_stoch,                               &
                            grid%stddev_cutoff_sppt,grid%gridpt_stddev_sppt, & 
@@ -222,6 +232,7 @@ CONTAINS
                           grid%num_stoch_levels,grid%num_stoch_levels,        &
                           grid%num_stoch_levels,grid%num_stoch_levels,        &
                           config_flags%restart, grid%iseedarr_sppt,           &
+                          config_flags%seed_dim,                              &
                           grid%DX,grid%DY,grid%sppt_vertstruc,                &
                           grid%rstoch,                                        &
                           grid%stddev_cutoff_sppt,grid%gridpt_stddev_sppt, & 
@@ -243,11 +254,70 @@ CONTAINS
                            grid%num_stoch_levels,grid%num_stoch_levels,        &
                            grid%num_stoch_levels,grid%num_stoch_levels,        &
                            config_flags%restart, grid%iseedarr_rand_pert,      &
+                           config_flags%seed_dim,                              &
                            grid%DX,grid%DY,grid%rand_pert_vertstruc,           &
                            grid%RAND_PERT,                                     &
                            grid%stddev_cutoff_rand_pert,grid%gridpt_stddev_rand_pert, & 
                            grid%VERTSTRUCC,grid%VERTSTRUCS,grid%VERTAMPT       )
       ENDIF !rand_perturb_on
+
+      IF ( grid%stepsp > 0 ) THEN
+         stepsp_test = ( MOD(grid%itimestep, grid%stepsp) == 0 )
+      ELSE
+         stepsp_test = .FALSE.
+      END IF
+      If_multi_perturb: if ((config_flags%multi_perturb==1).and.(grid%id == 1) .and. &
+          (stepsp_test .or. grid%itimestep == 1)) then
+        Loop_multi_perturb: DO n = 2, config_flags%num_pert_3d
+           CALL contiguize_2d ( .TRUE. , grid%SPFORCS3d, SPFORCS3d_loc, n,       &
+                                ips, ipe, jps, jpe, 1, config_flags%num_pert_3d, &
+                                ids, ide, jds, jde, 1, config_flags%num_pert_3d, &
+                                ims, ime, jms, jme, 1, config_flags%num_pert_3d  )
+           CALL contiguize_2d ( .TRUE. , grid%SPFORCC3d, SPFORCC3d_loc, n,       &
+                                ips, ipe, jps, jpe, 1, config_flags%num_pert_3d, &
+                                ids, ide, jds, jde, 1, config_flags%num_pert_3d, &
+                                ims, ime, jms, jme, 1, config_flags%num_pert_3d  )
+           CALL contiguize_2d ( .TRUE. , grid%SP_AMP3d,  SP_AMP3d_loc,  n,       &
+                                ips, ipe, jps, jpe, 1, config_flags%num_pert_3d, &
+                                ids, ide, jds, jde, 1, config_flags%num_pert_3d, &
+                                ims, ime, jms, jme, 1, config_flags%num_pert_3d  )
+           CALL RAND_PERT_UPDATE(grid,'T',                                     &
+                           SPFORCS3d_loc, SPFORCC3d_loc, SP_AMP3d_loc,         &
+                           grid%ALPH_RAND3d(n),                                &
+                           ips, ipe, jps, jpe, kps, kpe,                       &
+                           ids, ide, jds, jde, kds, kde,                       &
+                           ims, ime, jms, jme, kms, kme,                       &
+                           k_start, k_end,                                     &
+                           imsx,imex,jmsx,jmex,kmsx,kmex,                      &
+                           ipsx,ipex,jpsx,jpex,kpsx,kpex,                      &
+                           imsy,imey,jmsy,jmey,kmsy,kmey,                      &
+                           ipsy,ipey,jpsy,jpey,kpsy,kpey,                      &
+                           grid%num_stoch_levels,grid%num_stoch_levels,        &
+                           grid%num_stoch_levels,grid%num_stoch_levels,        &
+                           config_flags%restart, grid%iseedarr_mult3d(:,n),    &
+                           config_flags%seed_dim,                              &
+                           grid%DX,grid%DY,grid%mult3d_vertstruc(n),           &
+                           grid%PERT3D(:,:,:,n),                               &
+                           grid%stddev_cutoff_mult3d(n),                       &
+                           grid%gridpt_stddev_mult3d(n),                       &
+                           grid%VERTSTRUCC3d(:,:,:,n),                         &
+                           grid%VERTSTRUCS3d(:,:,:,n),                         &
+                           grid%VERTAMPT3d(:,n)                                )
+           CALL contiguize_2d ( .FALSE., grid%SPFORCS3d, SPFORCS3d_loc, n,       &
+                                ips, ipe, jps, jpe, 1, config_flags%num_pert_3d, &
+                                ids, ide, jds, jde, 1, config_flags%num_pert_3d, &
+                                ims, ime, jms, jme, 1, config_flags%num_pert_3d  )
+           CALL contiguize_2d ( .FALSE., grid%SPFORCC3d, SPFORCC3d_loc, n,       &
+                                ips, ipe, jps, jpe, 1, config_flags%num_pert_3d, &
+                                ids, ide, jds, jde, 1, config_flags%num_pert_3d, &
+                                ims, ime, jms, jme, 1, config_flags%num_pert_3d  )
+           CALL contiguize_2d ( .FALSE., grid%SP_AMP3d,  SP_AMP3d_loc,  n,       &
+                                ips, ipe, jps, jpe, 1, config_flags%num_pert_3d, &
+                                ids, ide, jds, jde, 1, config_flags%num_pert_3d, &
+                                ims, ime, jms, jme, 1, config_flags%num_pert_3d  )
+        END DO Loop_multi_perturb
+      ENDIF If_multi_perturb
+
       if ((grid%spp_conv==1).and.(grid%id .EQ. 1 )) then
            CALL RAND_PERT_UPDATE(grid,'T',                                     &
                            grid%SPFORCS2,grid%SPFORCC2,                        &
@@ -263,6 +333,7 @@ CONTAINS
                            grid%num_stoch_levels,grid%num_stoch_levels,        &
                            grid%num_stoch_levels,grid%num_stoch_levels,        &
                            config_flags%restart, grid%iseedarr_spp_conv,          &
+                           config_flags%seed_dim,                              &
                            grid%DX,grid%DY,grid%vertstruc_spp_conv,            &
                            grid%pattern_spp_conv,                             & 
                            grid%stddev_cutoff_spp_conv,grid%gridpt_stddev_spp_conv, & 
@@ -283,6 +354,7 @@ CONTAINS
                            grid%num_stoch_levels,grid%num_stoch_levels,        &
                            grid%num_stoch_levels,grid%num_stoch_levels,        &
                            config_flags%restart, grid%iseedarr_spp_pbl,           &
+                           config_flags%seed_dim,                              &
                            grid%DX,grid%DY,grid%vertstruc_spp_pbl,             &
                            grid%pattern_spp_pbl,                             & 
                            grid%stddev_cutoff_spp_pbl,grid%gridpt_stddev_spp_pbl, & 
@@ -303,6 +375,7 @@ CONTAINS
                            grid%num_stoch_levels,grid%num_stoch_levels,        &
                            grid%num_stoch_levels,grid%num_stoch_levels,        &
                            config_flags%restart, grid%iseedarr_spp_lsm,           &
+                           config_flags%seed_dim,                              &
                            grid%DX,grid%DY,grid%vertstruc_spp_lsm,             &
                            grid%pattern_spp_lsm,                             & 
                            grid%stddev_cutoff_spp_lsm,grid%gridpt_stddev_spp_lsm, & 
@@ -333,6 +406,14 @@ BENCH_START(cal_phy_tend)
                      grid%rqishten,grid%rqsshten,grid%rqgshten,        &
                      grid%RUNDGDTEN,grid%RVNDGDTEN,grid%RTHNDGDTEN,grid%RQVNDGDTEN, &
                      grid%RMUNDGDTEN,                                  &
+                     grid%ruiauten,grid%rviauten,grid%rthiauten,       &
+                     grid%rqviauten,grid%rqciauten,grid%rqriauten,     &
+                     grid%rqiiauten,grid%rqsiauten,grid%rqgiauten,     &
+                     grid%rmuiauten,grid%rphiauten,                    &
+                     grid%u_iau,grid%v_iau,grid%t_iau,grid%ph_iau,     &
+                     grid%mu_iau,grid%qv_iau,grid%qc_iau,grid%qr_iau,  &
+                     grid%qs_iau,grid%qi_iau,grid%qg_iau,              &
+                     grid%itimestep,                                   &
                      scalar, scalar_tend, num_scalar,                  &
                      tracer, tracer_tend, num_tracer,                  &
                      ids,ide, jds,jde, kds,kde,                        &
@@ -501,6 +582,43 @@ BENCH_START(calc_tke_tim)
          !$OMP PRIVATE ( ij )
          DO ij = 1 , grid%num_tiles
 
+!XZ
+         IF( config_flags%diff_opt .eq. 2 .and. config_flags%km_opt .eq. 5 ) THEN
+           CALL nonlocal_flux(config_flags,grid%nlflux,grid%gamu,grid%gamv,      &
+                              grid%pblh,grid%kpbl,grid%dx,grid%dy,grid%dt,       &
+                              grid%ust,grid%hfx,grid%qfx,grid%br,ep_1,ep_2,      & 
+                              karman,grid%u_phy,grid%v_phy,th_phy,grid%rho,      & 
+                              moist,num_moist,                                   &
+                              grid%msftx,grid%msfty,grid%rdzw,                   &
+                              grid%u10,grid%v10,grid%wspd,                       &
+                              ids, ide, jds, jde, kds, kde,                      &
+                              ims, ime, jms, jme, kms, kme,                      &
+                              grid%i_start(ij), grid%i_end(ij),                  &
+                              grid%j_start(ij), grid%j_end(ij),                  &
+                              k_start, k_end  )
+ 
+           CALL free_atmos_length(config_flags,grid%dx,grid%dy,grid%rdzw,        &
+                                  grid%rdz,grid%tke_2,th_phy,grid%elmin,         &
+                                  grid%hfx,grid%qfx,moist,num_moist,             &
+                                  ids, ide, jds, jde, kds, kde,                  &
+                                  ims, ime, jms, jme, kms, kme,                  &
+                                  grid%i_start(ij),grid%i_end(ij),               &
+                                  grid%j_start(ij), grid%j_end(ij),              &
+                                  k_start, k_end  )
+  
+           CALL meso_length_scale(config_flags,grid%dx,grid%dy,grid%rdzw,        &
+                                  grid%rdz,grid%tke_2,p8w,t8w,th_phy,            &
+                                  grid%dlk,grid%pblh,grid%elmin,                 &
+                                  grid%rmol,grid%rho,grid%hfx,grid%qfx,          &
+                                  moist,num_moist,                               &
+                                  ids, ide, jds, jde, kds, kde,                  &
+                                  ims, ime, jms, jme, kms, kme,                  &
+                                  grid%i_start(ij), grid%i_end(ij),              &
+                                  grid%j_start(ij), grid%j_end(ij),              &
+                                  k_start, k_end  ) 
+         ENDIF
+!!
+
            CALL wrf_debug ( 200 , ' call calculate_km_kh' )
            CALL calculate_km_kh( config_flags,grid%dt,grid%dampcoef,grid%zdamp,         &
                                  config_flags%damp_opt,                                 &
@@ -516,6 +634,7 @@ BENCH_START(calc_tke_tim)
                                  grid%mix_upper_bound,                                  &
                                  grid%msftx, grid%msfty,                                &
                                  grid%zx, grid%zy,                                      & 
+                                 grid%pblh, grid%dlk, grid%xkmv_meso,                   &  
                                  ids,ide, jds,jde, kds,kde,                             &
                                  ims,ime, jms,jme, kms,kme,                             &
                                  grid%i_start(ij), grid%i_end(ij),                      &
@@ -553,6 +672,7 @@ BENCH_START(phy_bc_tim)
                       grid%rublten, grid%rvblten,                  &
                       grid%rucuten, grid%rvcuten,                  &
                       grid%rushten, grid%rvshten,                  &
+                      grid%gamu, grid%gamv, grid%xkmv_meso,        &  ! XZ
                       ids, ide, jds, jde, kds, kde,                &
                       ims, ime, jms, jme, kms, kme,                &
                       ips, ipe, jps, jpe, kps, kpe,                &
@@ -629,9 +749,11 @@ ENDIF
        IF ( config_flags%cu_physics == SASSCHEME      .or.   &
             config_flags%cu_physics == TIEDTKESCHEME  .or.   &
             config_flags%cu_physics == NTIEDTKESCHEME .or.   &
+            config_flags%cu_physics == MSKFSCHEME     .or.   &
             config_flags%cu_physics == CAMZMSCHEME    .or.   &
             config_flags%cu_physics == SCALESASSCHEME .or.   &
-            config_flags%cu_physics == NSASSCHEME ) THEN
+            config_flags%cu_physics == NSASSCHEME     .or.   &
+            config_flags%cu_physics == KSASSCHEME ) THEN
 #      include "HALO_EM_PHYS_CU.inc"
        ENDIF
        IF ( config_flags%grid_fdda .ge. 1) THEN
@@ -641,12 +763,12 @@ ENDIF
 #      include "HALO_EM_PHYS_DIFFUSION.inc"
        ENDIF
 
-       IF      ( config_flags%h_mom_adv_order <= 4 ) THEN
+       IF      ( config_flags%h_sca_adv_order <= 4 ) THEN
 #       include "HALO_EM_TKE_3.inc"
-       ELSE IF ( config_flags%h_mom_adv_order <= 6 ) THEN
+       ELSE IF ( config_flags%h_sca_adv_order <= 6 ) THEN
 #       include "HALO_EM_TKE_5.inc"
        ELSE
-         WRITE(wrf_err_message,*)'solve_em: invalid h_mom_adv_order = ',config_flags%h_mom_adv_order
+         WRITE(wrf_err_message,*)'solve_em: invalid h_sca_adv_order = ',config_flags%h_sca_adv_order
          CALL wrf_error_fatal(TRIM(wrf_err_message))
        ENDIF
 #endif
@@ -699,6 +821,10 @@ BENCH_START(update_phy_ten_tim)
                            grid%RVNDGDTEN,grid%RTHNDGDTEN,grid%RPHNDGDTEN,  &
                            grid%RQVNDGDTEN,grid%RMUNDGDTEN,                 &
                            grid%rthfrten,grid%rqvfrten,                     &  ! fire
+                           grid%ruiauten,grid%rviauten,grid%rthiauten,      &
+                           grid%rqviauten,grid%rqciauten,grid%rqriauten,    &
+                           grid%rqiiauten,grid%rqsiauten,grid%rqgiauten,    &
+                           grid%rphiauten,grid%rmuiauten,                   &
                            num_moist,num_scalar,config_flags,rk_step,       &
                            grid%adv_moist_cond,                             &
                            ids, ide, jds, jde, kds, kde,                    &
@@ -744,11 +870,11 @@ BENCH_END(update_phy_ten_tim)
       IF (grid%sppt_on==1) then
           !$OMP PARALLEL DO   &
           !$OMP PRIVATE ( ij )
-          ! JB comment:  P_QV is in moist_tend(ims,kms,jms,2)
           DO ij = 1 , grid%num_tiles
                  call perturb_physics_tend(grid%gridpt_stddev_sppt,          &
                         grid%stddev_cutoff_sppt,grid%rstoch,                 &
-                        ru_tendf,rv_tendf,t_tendf,moist_tend(ims,kms,jms,2), &
+                        ru_tendf,rv_tendf,t_tendf,                           &
+                        moist_tend(ims,kms,jms,p_qv),                        &
                         ids, ide, jds, jde, kds, kde,                        &
                         ims, ime, jms, jme, kms, kme,                        &
                         grid%i_start(ij), grid%i_end(ij),                    &
@@ -765,8 +891,10 @@ BENCH_END(update_phy_ten_tim)
 
 =============================================================
 INTENTIONALLY PLACED HERE TO BREAK COMPILE
-The DAMPTOP routine needs to have 1d column arrays c1 and c2
+1. The DAMPTOP routine needs to have 1d column arrays c1 and c2
 to correctly use the column pressures mut, muu, and muv.
+2. The DAMPTOP routine needs to have the grid%t_2 evaluated
+to see if perturbation of moist potential temperature is OK.
 =============================================================
 
        IF ( (config_flags%damp_opt == 101) .OR. &
@@ -788,7 +916,8 @@ to correctly use the column pressures mut, muu, and muv.
        END IF
 #endif
 
-       IF( config_flags%diff_opt .eq. 2 .and. config_flags%km_opt .eq. 2 ) THEN
+       IF( config_flags%diff_opt .eq. 2 .and. ( config_flags%km_opt .eq. 2 .or. &
+           config_flags%km_opt .eq. 5 ) ) THEN  ! XZ
 
 BENCH_START(tke_rhs_tim)
          !$OMP PARALLEL DO   &
@@ -810,6 +939,8 @@ BENCH_START(tke_rhs_tim)
                          grid%dnw,config_flags%mix_isotropic,         &
                          grid%hfx, grid%qfx, moist(ims,kms,jms,P_QV), &
                          grid%ustm, grid%rho,                         &
+                         grid%l_diss, grid%nlflux,                    & !XZ
+                         grid%pblh, grid%dlk,                         & !XZ 
                          ids, ide, jds, jde, kds, kde,                &
                          ims, ime, jms, jme, kms, kme,                &
                          grid%i_start(ij), grid%i_end(ij),            &
@@ -820,80 +951,6 @@ BENCH_START(tke_rhs_tim)
          !$OMP END PARALLEL DO
 BENCH_END(tke_rhs_tim)
 
-       ENDIF
-
-! calculate vertical diffusion first and then horizontal
-! (keep this order)
-
-       IF(config_flags%diff_opt .eq. 2) THEN
-
-         IF (config_flags%bl_pbl_physics .eq. 0) THEN
-
-BENCH_START(vert_diff_tim)
-           !$OMP PARALLEL DO   &
-           !$OMP PRIVATE ( ij )
-           DO ij = 1 , grid%num_tiles
-
-             CALL wrf_debug ( 200 , ' call vertical_diffusion_2 ' )
-             CALL vertical_diffusion_2( ru_tendf, rv_tendf, rw_tendf,            &
-                                      t_tendf, tke_tend,                         &
-                                      moist_tend, num_moist,                      &
-                                      chem_tend, num_chem,                       &
-                                      scalar_tend, num_scalar,                     &
-                                      tracer_tend, num_tracer,                     &
-                                      grid%u_2, grid%v_2,                                  &
-                                      grid%t_2,grid%u_base,grid%v_base,grid%t_base,grid%qv_base,          &
-                                      grid%tke_2, config_flags,              &
-                                      grid%defor13,grid%defor23,grid%defor33,                   &
-                                      nba_mij, num_nba_mij,          & !JDM
-                                      grid%div, moist, chem, scalar,tracer,         &
-                                      grid%xkmv, grid%xkhv, grid%xkmh, config_flags%km_opt,       & ! xkmh added Oct2013
-                                      grid%fnm, grid%fnp, grid%dn, grid%dnw, grid%rdz, grid%rdzw, &
-                                      grid%hfx, grid%qfx, grid%hdo_qfx, grid%o18_qfx, grid%ustm, grid%rho,        & !bloss/wiso
-                                      ids, ide, jds, jde, kds, kde,              &
-                                      ims, ime, jms, jme, kms, kme,              &
-                                      grid%i_start(ij), grid%i_end(ij),          &
-                                      grid%j_start(ij), grid%j_end(ij),          &
-                                      k_start, k_end                             )
-
-           ENDDO
-           !$OMP END PARALLEL DO
-BENCH_END(vert_diff_tim)
-
-         ENDIF
-!
-BENCH_START(hor_diff_tim)
-         !$OMP PARALLEL DO   &
-         !$OMP PRIVATE ( ij )
-         DO ij = 1 , grid%num_tiles
-
-           CALL wrf_debug ( 200 , ' call horizontal_diffusion_2' )
-           CALL horizontal_diffusion_2( t_tendf, ru_tendf, rv_tendf, rw_tendf, &
-                                      tke_tend,                              &
-                                      moist_tend, num_moist,                  &
-                                      chem_tend, num_chem,                   &
-                                      scalar_tend, num_scalar,                 &
-                                      tracer_tend, num_tracer,                 &
-                                      grid%t_2, th_phy,                           &
-                                      grid%tke_2, config_flags,              &
-                                      grid%defor11, grid%defor22, grid%defor12,             &
-                                      grid%defor13, grid%defor23,   &
-                                      nba_mij, num_nba_mij,         & !JDM
-                                      grid%div,                     &
-                                      moist, chem, scalar,tracer,               &
-                                      grid%msfux,grid%msfuy, grid%msfvx,grid%msfvy, grid%msftx,  &
-                                      grid%msfty, grid%xkmh, grid%xkhh, config_flags%km_opt,     &
-                                      grid%rdx, grid%rdy, grid%rdz, grid%rdzw,                   &
-                                      grid%fnm, grid%fnp, grid%cf1, grid%cf2, grid%cf3,          &
-                                      grid%zx, grid%zy, grid%dn, grid%dnw, grid%rho,             &
-                                      ids, ide, jds, jde, kds, kde,          &
-                                      ims, ime, jms, jme, kms, kme,          &
-                                      grid%i_start(ij), grid%i_end(ij),      &
-                                      grid%j_start(ij), grid%j_end(ij),      &
-                                      k_start    , k_end                    )
-         ENDDO
-         !$OMP END PARALLEL DO
-BENCH_END(hor_diff_tim)
        ENDIF
 
        IF ( grid%obs_nudge_opt .EQ. 1 .AND. grid%xtime <= grid%fdda_end ) THEN
@@ -943,7 +1000,7 @@ BENCH_END(hor_diff_tim)
                    grid%mut, grid%muu, grid%muv, grid%c1h, grid%c2h,    &
                    grid%msftx, grid%msfty, grid%msfux, grid%msfuy, grid%msfvx, grid%msfvy, &
                    p_phy, t_tendf, t0,                                  &
-                   grid%u_2, grid%v_2, grid%t_2,                        &
+                   grid%u_2, grid%v_2, grid%th_phy_m_t0,                &
                    moist(ims,kms,jms,P_QV),                             &
                    grid%pb, grid%p_top, grid%p, grid%phb, grid%ph_2,    &
                    grid%uratx, grid%vratx, grid%tratx,                  &
@@ -959,6 +1016,128 @@ BENCH_END(hor_diff_tim)
          ENDDO
          !$OMP END PARALLEL DO
        ENDIF  ! obs_nudge_opt .eq. 1
+
+       IF ( config_flags%use_theta_m .EQ. 1 ) THEN
+         !$OMP PARALLEL DO   &
+         !$OMP PRIVATE ( ij )
+         DO ij = 1 , grid%num_tiles
+           CALL conv_t_tendf_to_moist ( grid%t_1 , moist_old(ims,kms,jms,P_qv) ,  &
+                                        t_tendf  , moist_tend(ims,kms,jms,P_qv) , &
+                                        ids, ide, jds, jde, kds, kde ,            &
+                                        ims, ime, jms, jme, kms, kme ,            &
+                                        grid%i_start(ij), grid%i_end(ij),         &
+                                        grid%j_start(ij), grid%j_end(ij),         &
+                                        k_start    , k_end                        )
+         END DO 
+         !$OMP END PARALLEL DO
+       END IF ! use moist theta
+
+! calculate vertical diffusion first and then horizontal
+! (keep this order)
+
+       IF(config_flags%diff_opt .eq. 2) THEN
+
+         IF (config_flags%bl_pbl_physics .eq. 0) THEN
+
+!XZ    implicit solver for vertical diffusion tendency
+         IF( config_flags%km_opt .eq. 5 ) THEN
+              !$OMP PARALLEL DO   &
+              !$OMP PRIVATE ( ij )
+              DO ij = 1 , grid%num_tiles
+              CALL vertical_diffusion_implicit(ru_tendf, rv_tendf, rw_tendf,                              &
+                                               t_tendf, tke_tend,                                         &
+                                               moist_tend, num_moist,                                     &
+                                               chem_tend, num_chem,                                       &
+                                               scalar_tend, num_scalar,                                   &
+                                               tracer_tend, num_tracer,                                   &
+                                               grid%u_2, grid%v_2,grid%w_2,grid%dt,                       &
+                                               grid%t_2,grid%u_base,grid%v_base,grid%t_base,grid%qv_base, &
+                                               grid%mut,grid%tke_2,th_phy,config_flags,                   &
+                                               moist, chem, scalar, tracer,                               &
+                                               grid%xkmv, grid%xkhv, grid%xkmh, config_flags%km_opt,      &
+                                               grid%fnm, grid%fnp, grid%dn, grid%dnw, grid%rdz, grid%rdzw,&
+                                               grid%hfx, grid%qfx, grid%hdo_qfx, grid%o18_qfx, grid%ustm, grid%rho,   & !bloss/wiso
+                                               grid%nlflux, grid%gamu, grid%gamv,                         & 
+                                               grid%xkmv_meso, grid%l_diss,                               &
+                                               grid%c1h, grid%c2h, grid%c1f, grid%c2f,                    &
+                                               ids, ide, jds, jde, kds, kde,                              &
+                                               ims, ime, jms, jme, kms, kme,                              &
+                                               grid%i_start(ij), grid%i_end(ij),                          &
+                                               grid%j_start(ij), grid%j_end(ij),                          &
+                                               k_start, k_end      )
+              ENDDO
+              !$OMP END PARALLEL DO
+
+         ELSE  ! original explicit 
+
+BENCH_START(vert_diff_tim)
+           !$OMP PARALLEL DO   &
+           !$OMP PRIVATE ( ij )
+           DO ij = 1 , grid%num_tiles
+
+             CALL wrf_debug ( 200 , ' call vertical_diffusion_2 ' )
+             CALL vertical_diffusion_2( ru_tendf, rv_tendf, rw_tendf,            &
+                                      t_tendf, tke_tend,                         &
+                                      moist_tend, num_moist,                      &
+                                      chem_tend, num_chem,                       &
+                                      scalar_tend, num_scalar,                     &
+                                      tracer_tend, num_tracer,                     &
+                                      grid%u_2, grid%v_2,                                  &
+                                      grid%t_2,grid%u_base,grid%v_base,grid%t_base,grid%qv_base,          &
+                                      grid%tke_2, th_phy, config_flags,              &
+                                      grid%defor13,grid%defor23,grid%defor33,                   &
+                                      nba_mij, num_nba_mij,          & !JDM
+                                      grid%div, moist, chem, scalar,tracer,         &
+                                      grid%xkmv, grid%xkhv, grid%xkmh, config_flags%km_opt,       & ! xkmh added Oct2013
+                                      grid%fnm, grid%fnp, grid%dn, grid%dnw, grid%rdz, grid%rdzw, &
+                                      grid%hfx, grid%qfx, grid%hdo_qfx, grid%o18_qfx, grid%ustm, grid%rho,        & !bloss/wiso
+                                      ids, ide, jds, jde, kds, kde,              &
+                                      ims, ime, jms, jme, kms, kme,              &
+                                      grid%i_start(ij), grid%i_end(ij),          &
+                                      grid%j_start(ij), grid%j_end(ij),          &
+                                      k_start, k_end                             )
+
+           ENDDO
+           !$OMP END PARALLEL DO
+BENCH_END(vert_diff_tim)
+
+         ENDIF
+        ENDIF
+!
+BENCH_START(hor_diff_tim)
+         !$OMP PARALLEL DO   &
+         !$OMP PRIVATE ( ij )
+         DO ij = 1 , grid%num_tiles
+
+           CALL wrf_debug ( 200 , ' call horizontal_diffusion_2' )
+           CALL horizontal_diffusion_2( t_tendf, ru_tendf, rv_tendf, rw_tendf, &
+                                      tke_tend,                              &
+                                      moist_tend, num_moist,                  &
+                                      chem_tend, num_chem,                   &
+                                      scalar_tend, num_scalar,                 &
+                                      tracer_tend, num_tracer,                 &
+                                      grid%t_2, th_phy,                           &
+                                      grid%tke_2, config_flags,              &
+                                      grid%defor11, grid%defor22, grid%defor12,             &
+                                      grid%defor13, grid%defor23,   &
+                                      nba_mij, num_nba_mij,         & !JDM
+                                      grid%div,                     &
+                                      moist, chem, scalar,tracer,               &
+                                      grid%msfux,grid%msfuy, grid%msfvx,grid%msfvy, grid%msftx,  &
+                                      grid%msfty, grid%xkmh, grid%xkmv, grid%xkhh, config_flags%km_opt,     &
+                                      grid%rdx, grid%rdy, grid%rdz, grid%rdzw,                   &
+                                      grid%fnm, grid%fnp, grid%cf1, grid%cf2, grid%cf3,          &
+                                      grid%zx, grid%zy, grid%dn, grid%dnw, grid%rho,             &
+                                      ids, ide, jds, jde, kds, kde,          &
+                                      ims, ime, jms, jme, kms, kme,          &
+                                      grid%i_start(ij), grid%i_end(ij),      &
+                                      grid%j_start(ij), grid%j_end(ij),      &
+                                      k_start    , k_end                    )
+         ENDDO
+         !$OMP END PARALLEL DO
+BENCH_END(hor_diff_tim)
+       ENDIF
+
 ! 
 !***********************************************************************
 

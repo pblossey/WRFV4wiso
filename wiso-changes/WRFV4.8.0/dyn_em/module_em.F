@@ -1,28 +1,3 @@
-#if ( HYBRID_COORD==1 ) 
-#  define mut(...) (c1(k)*XXPCTXX(__VA_ARGS__)+c2(k))
-#  define XXPCTXX(...) mut(__VA_ARGS__)
-
-#  define muu(...) (c1(k)*XXPCUXX(__VA_ARGS__)+c2(k))
-#  define XXPCUXX(...) muu(__VA_ARGS__)
-
-#  define muv(...) (c1(k)*XXPCVXX(__VA_ARGS__)+c2(k))
-#  define XXPCVXX(...) muv(__VA_ARGS__)
-
-#  define MUT(...) (c1f(k)*XXPCTFXX(__VA_ARGS__)+c2f(k))
-#  define XXPCTFXX(...) MUT(__VA_ARGS__)
-
-#  define MUU(...) (c1h(k)*XXPCUHXX(__VA_ARGS__)+c2h(k))
-#  define XXPCUHXX(...) MUU(__VA_ARGS__)
-
-#  define MUV(...) (c1h(k)*XXPCVHXX(__VA_ARGS__)+c2h(k))
-#  define XXPCVHXX(...) MUV(__VA_ARGS__)
-
-#  define muold(...) (c1(k)*XXPCTOLDXX(__VA_ARGS__)+c2(k))
-#  define XXPCTOLDXX(...) muold(__VA_ARGS__)
-
-#  define munew(...) (c1(k)*XXPCTNEWXX(__VA_ARGS__)+c2(k))
-#  define XXPCTNEWXX(...) munew(__VA_ARGS__)
-#endif
 
 !WRF:MODEL_LAYER:DYNAMICS
 !
@@ -34,15 +9,16 @@ MODULE module_em
    USE module_advect_em, only: advect_u, advect_v, advect_w, advect_scalar, advect_scalar_pd, advect_scalar_mono, &
         advect_weno_u, advect_weno_v, advect_weno_w, advect_scalar_weno,  advect_scalar_wenopd
    
-   USE module_big_step_utilities_em, only: grid_config_rec_type, calculate_full, couple_momentum, calc_mu_uv, calc_ww_cp, &
-        calc_cq, calc_alt, calc_php, set_tend, rhs_ph, &
-   	horizontal_pressure_gradient, pg_buoy_w, w_damp, perturbation_coriolis, coriolis, curvature, horizontal_diffusion, &
-        horizontal_diffusion_3dmp, vertical_diffusion_u, &
-	vertical_diffusion_v, vertical_diffusion, vertical_diffusion_3dmp, sixth_order_diffusion, rk_rayleigh_damp, &
-        theta_relaxation, vertical_diffusion_mp, zero_tend, zero_tend2d
+   USE module_big_step_utilities_em, only: grid_config_rec_type, calculate_full, couple_momentum, calc_mu_uv, calc_mu_uv_1, &
+        calc_ww_cp, calc_cq, calc_alt, calc_php, set_tend, rhs_ph, horizontal_pressure_gradient, pg_buoy_w, w_damp, &
+        perturbation_coriolis, coriolis, curvature, horizontal_diffusion, horizontal_diffusion_3dmp, &
+        vertical_diffusion_u, vertical_diffusion_v, vertical_diffusion, vertical_diffusion_3dmp, sixth_order_diffusion, & 
+        rk_rayleigh_damp, theta_relaxation, vertical_diffusion_mp, zero_tend, zero_tend2d
 	
+  USE module_ieva_em, only: advect_u_implicit, advect_v_implicit, advect_w_implicit, advect_s_implicit, advect_ph_implicit, &
+                            chk_ieva, ww_split, calc_mut_new
    USE module_state_description, only: param_first_scalar, p_qr, p_qv, p_qc, p_qg, p_qi, p_qs, tiedtkescheme, ntiedtkescheme, heldsuarez, &
-        positivedef, gdscheme, g3scheme, gfscheme, kfetascheme, mskfscheme, monotonic, wenopd_scalar, weno_scalar, weno_mom, &
+        positivedef, gdscheme, g3scheme, gflscheme, kfetascheme, mskfscheme, monotonic, wenopd_scalar, weno_scalar, weno_mom, &
         p_hdo_qv, p_o18_qv      !bloss/wiso
 	
    USE module_damping_em, only: held_suarez_damp
@@ -217,12 +193,13 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
                          ru_tendf, rv_tendf, rw_tendf, ph_tendf, t_tendf, &
                          mu_tend, u_save, v_save, w_save, ph_save,        &
                          t_save, mu_save, RTHFTEN,                        &
-                         ru, rv, rw, ww,                                  &
+                         ru, rv, rw, ww, wwE, wwI,                        &
                          u, v, w, t, ph,                                  &
                          u_old, v_old, w_old, t_old, ph_old,              &
                          h_diabatic, phb,t_init,                          &
-                         mu, mut, muu, muv, mub, c1h, c2h, c1f, c2f,      &
-                         al, alt, p, pb, php, cqu, cqv, cqw,              &
+                         mu_old, mu, mut, muu, muv, mub,                  &
+                         c1h, c2h, c1f, c2f,                              &
+                         al, ht, alt, p, pb, php, cqu, cqv, cqw,          &
                          u_base, v_base, t_base, qv_base, z_base,         &
                          msfux, msfuy, msfvx, msfvx_inv,                  &
                          msfvy, msftx, msfty,                             &
@@ -318,11 +295,13 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
                                                                     e,       &
                                                                     sina,    &
                                                                     cosa,    &
+                                                                    mu_old,  &
                                                                     mu,      &
                                                                     mut,     &
                                                                     mub,     &
                                                                     muu,     &
-                                                                    muv
+                                                                    muv,     &
+                                                                    ht             
 
    REAL , DIMENSION( kms:kme ) ,                 INTENT(IN   ) :: fnm,     &
                                                                   fnp,     &
@@ -359,6 +338,15 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
    REAL    :: kdift, khdq, kvdq, cfn, cfn1, cf1, cf2, cf3
    INTEGER :: i,j,k
    INTEGER :: time_step
+   INTEGER :: rk_order
+   REAL    :: dt_step
+
+! IEVA declarations
+   REAL , DIMENSION( ims:ime, kms:kme, jms:jme ) :: wwE, wwI  
+   REAL , DIMENSION( ims:ime , jms:jme )         :: mut_old, mut_new                                                              
+   REAL , DIMENSION( ims:ime , jms:jme )         :: muu_old, muu_new                                                              
+   REAL , DIMENSION( ims:ime , jms:jme )         :: muv_old, muv_new                                                              
+   LOGICAL                                       :: ieva
 
 !<DESCRIPTION>
 !
@@ -440,64 +428,154 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
                     ims, ime, jms, jme, 1, 1, &
                     its, ite, jts, jte, 1, 1 )
 
-   !  advection tendencies
    CALL nl_get_time_step ( 1, time_step )
 
+   rk_order = config_flags%rk_ord
+   dt_step  = dt / (rk_order - rk_step + 1)   ! needed for calculations using sub-rk step
 
-    IF( (rk_step == 3) .and. ( adv_opt == WENO_MOM ) ) THEN
+                        
+! Code for splitting vertical velocity into ex/im parts
 
-     CALL advect_weno_u ( u, u , ru_tend, ru, rv, ww, &
-                   c1h, c2h,                     &
-                   mut, time_step, config_flags, &
-                   msfux, msfuy, msfvx, msfvy,   &
-                   msftx, msfty,                 &
-                   fnm, fnp, rdx, rdy, rdnw,     &
-                   ids, ide, jds, jde, kds, kde, &
-                   ims, ime, jms, jme, kms, kme, &
-                   its, ite, jts, jte, kts, kte )
+   CALL WW_SPLIT(wwE, wwI,                         &
+                 u,  v,  ww,                       &
+                 mut, rdnw, msfty,                 &
+                 c1f, c2f,                         &
+                 rdx, rdy, msfux, msfuy,           &
+                 msfvx, msfvy, dt,                 &
+                 config_flags, rk_step,            &
+                 ids, ide, jds, jde, kds, kde,     &
+                 ims, ime, jms, jme, kms, kme,     &
+                 its, ite, jts, jte, kts, kte )              
 
-     ELSE
+! IEVA ON/OFF
+   
+   ieva = CHK_IEVA( config_flags, rk_step ) 
+
+   IF( ieva ) THEN
+   
+! Need an estimate of the mut at the original ('n') time level...
+
+   CALL calculate_full( mut_old,  mub, mu_old,     &
+                        ids, ide, jds, jde, 1, 2,  &
+                        ims, ime, jms, jme, 1, 1,  &
+                        its, ite, jts, jte, 1, 1 )
+
+! Estimate new temporary column mass
+                        
+   CALL calc_mut_new ( u, v, c1h, c2h,                      &
+                       mut_old, muu, muv, mut_new,          &
+                       dt, rdx, rdy, msftx, msfty,          &
+                       msfux, msfuy, msfvx, msfvx_inv,      &
+                       msfvy, rdnw,                         &
+                       ids, ide, jds, jde, kds, kde,        &
+                       ims, ime, jms, jme, kms, kme,        &
+                       its, ite, jts, jte, kts, kte    )
+                         
+! Create staggered mass values for u and v points
+
+   CALL calc_mu_uv_1 ( config_flags,                 &
+                       mut_old, muu_old, muv_old,    &
+                       ids, ide, jds, jde, kds, kde, &
+                       ims, ime, jms, jme, kms, kme, &
+                       its, ite, jts, jte, kts, kte )
+                      
+   CALL calc_mu_uv_1 ( config_flags,                 &
+                       mut_new, muu_new, muv_new,    &
+                       ids, ide, jds, jde, kds, kde, &
+                       ims, ime, jms, jme, kms, kme, &
+                       its, ite, jts, jte, kts, kte )
+
+   ENDIF
+
+! Okay do normal advection now....using the wwE array
+
+   IF( (rk_step == rk_order) .and. ( adv_opt == WENO_MOM ) ) THEN
+
+     CALL advect_weno_u ( u, u , ru_tend, ru, rv, wwE,  &
+                          c1h, c2h,                     &
+                          mut, time_step, config_flags, &
+                          msfux, msfuy, msfvx, msfvy,   &
+                          msftx, msfty,                 &
+                          fnm, fnp, rdx, rdy, rdnw,     &
+                          ids, ide, jds, jde, kds, kde, &
+                          ims, ime, jms, jme, kms, kme, &
+                          its, ite, jts, jte, kts, kte )
+
+   ELSE
+
+     CALL advect_u ( u, u , ru_tend, ru, rv, wwE,  &
+                     c1h, c2h,                     &
+                     mut, time_step, config_flags, &
+                     msfux, msfuy, msfvx, msfvy,   &
+                     msftx, msfty,                 &
+                     fnm, fnp, rdx, rdy, rdnw,     &
+                     ids, ide, jds, jde, kds, kde, &
+                     ims, ime, jms, jme, kms, kme, &
+                     its, ite, jts, jte, kts, kte )
+   ENDIF
+
+   IF( ieva ) THEN
+
+     CALL advect_u_implicit ( u, u_old, ru_tend, ru, rv, wwI,  &
+                              c1h, c2h,                        &
+                              muu_old, muu, muu_new,           &
+                              config_flags,                    &
+                              msfux, msfuy, msfvx, msfvy,      &
+                              msftx, msfty,                    &
+                              fnm, fnp,                        &
+                              dt_step,                         &
+                              rdx, rdy, rdnw,                  &
+                              ids, ide, jds, jde, kds, kde,    &
+                              ims, ime, jms, jme, kms, kme,    &
+                              its, ite, jts, jte, kts, kte )
+   ENDIF
+
+   IF( (rk_step == rk_order) .and. ( adv_opt == WENO_MOM ) ) THEN
+
+      CALL advect_weno_v ( v, v , rv_tend, ru, rv, wwE,  &
+                           c1h, c2h,                     &
+                           mut, time_step, config_flags, &
+                           msfux, msfuy, msfvx, msfvy,   &
+                           msftx, msfty,                 &
+                           fnm, fnp, rdx, rdy, rdnw,     &
+                           ids, ide, jds, jde, kds, kde, &
+                           ims, ime, jms, jme, kms, kme, &
+                           its, ite, jts, jte, kts, kte )
+
+   ELSE
+
+     CALL advect_v ( v, v , rv_tend, ru, rv, wwE,  &
+                     c1h, c2h,                     &
+                     mut, time_step, config_flags, &
+                     msfux, msfuy, msfvx, msfvy,   &
+                     msftx, msfty,                 &
+                     fnm, fnp, rdx, rdy, rdnw,     &
+                     ids, ide, jds, jde, kds, kde, &
+                     ims, ime, jms, jme, kms, kme, &
+                     its, ite, jts, jte, kts, kte )
+   ENDIF
+
+   IF( ieva ) THEN
      
-     CALL advect_u ( u, u , ru_tend, ru, rv, ww, &
-                   c1h, c2h,                     &
-                   mut, time_step, config_flags, &
-                   msfux, msfuy, msfvx, msfvy,   &
-                   msftx, msfty,                 &
-                   fnm, fnp, rdx, rdy, rdnw,     &
-                   ids, ide, jds, jde, kds, kde, &
-                   ims, ime, jms, jme, kms, kme, &
-                   its, ite, jts, jte, kts, kte )
-      ENDIF
-
-     IF( (rk_step == 3) .and. ( adv_opt == WENO_MOM ) ) THEN
-
-     CALL advect_weno_v ( v, v , rv_tend, ru, rv, ww,  &
-                   c1h, c2h,                     &
-                   mut, time_step, config_flags, &
-                   msfux, msfuy, msfvx, msfvy,   &
-                   msftx, msfty,                 &
-                   fnm, fnp, rdx, rdy, rdnw,     &
-                   ids, ide, jds, jde, kds, kde, &
-                   ims, ime, jms, jme, kms, kme, &
-                   its, ite, jts, jte, kts, kte )
-
-    ELSE
-     
-     CALL advect_v ( v, v , rv_tend, ru, rv, ww,  &
-                   c1h, c2h,                     &
-                   mut, time_step, config_flags, &
-                   msfux, msfuy, msfvx, msfvy,   &
-                   msftx, msfty,                 &
-                   fnm, fnp, rdx, rdy, rdnw,     &
-                   ids, ide, jds, jde, kds, kde, &
-                   ims, ime, jms, jme, kms, kme, &
-                   its, ite, jts, jte, kts, kte )
-    ENDIF
-
+     CALL advect_v_implicit ( v, v_old, rv_tend, ru, rv, wwI,  &
+                              c1h, c2h,                        &
+                              muv_old, muv, muv_new,           &
+                              config_flags,                    &
+                              msfux, msfuy, msfvx, msfvy,      &
+                              msftx, msfty,                    &
+                              fnm, fnp,                        &
+                              dt_step,                         &
+                              rdx, rdy, rdnw,                  &
+                              ids, ide, jds, jde, kds, kde,    &
+                              ims, ime, jms, jme, kms, kme,    &
+                              its, ite, jts, jte, kts, kte )
+   ENDIF
 
    IF (non_hydrostatic) THEN
-     IF( (rk_step == 3) .and. ( adv_opt == WENO_MOM ) ) THEN
-     CALL advect_weno_w ( w, w, rw_tend, ru, rv, ww,    &
+
+     IF( (rk_step == rk_order) .and. ( adv_opt == WENO_MOM ) ) THEN
+
+       CALL advect_weno_w ( w, w, rw_tend, ru, rv, wwE,   &
                      c1h, c2h,                     &
                      mut, time_step, config_flags, &
                      msfux, msfuy, msfvx, msfvy,   &
@@ -509,7 +587,7 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
 
      ELSE
      
-     CALL advect_w ( w, w, rw_tend, ru, rv, ww,    &
+       CALL advect_w ( w, w, rw_tend, ru, rv, wwE,   &
                      c1h, c2h,                     &
                      mut, time_step, config_flags, &
                      msfux, msfuy, msfvx, msfvy,   &
@@ -519,7 +597,9 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
                      ims, ime, jms, jme, kms, kme, &
                      its, ite, jts, jte, kts, kte )
      ENDIF
-   ENDIF
+
+   ENDIF  ! non-hydrostatic
+
 !  theta flux divergence
 
 ! 11/2016 ERM: Use WENO for theta flux on 3rd RK step if using WENO_SCALAR or WENOPD_SCALAR
@@ -527,11 +607,12 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
       IF(  ( config_flags%scalar_adv_opt == WENO_SCALAR  &
                  .or. config_flags%scalar_adv_opt == WENOPD_SCALAR    &
                  .or. config_flags%moist_adv_opt == WENO_SCALAR       &
-                 .or. config_flags%moist_adv_opt == WENOPD_SCALAR     &
-                       )  .and. (rk_step == 3) ) THEN
+     .or. config_flags%moist_adv_opt == WENOPD_SCALAR )   &
+     .and. (rk_step == rk_order) ) THEN
+     
 ! also use weno for monotonic scalar option so that the h_ and z_tendency arrays are not needed
 
-        CALL advect_scalar_weno ( t, t, t_tend, ru, rv, ww,     &
+     CALL advect_scalar_weno ( t, t, t_tend, ru, rv, wwE,     &
                                  c1h, c2h, mut, time_step,      &
                                  config_flags,                  &
                                  msfux, msfuy, msfvx, msfvy,    &
@@ -542,7 +623,7 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
                                  its, ite, jts, jte, kts, kte  )
      ELSE
 
-     CALL advect_scalar ( t, t, t_tend, ru, rv, ww,     &
+     CALL advect_scalar ( t, t, t_tend, ru, rv, wwE,    &
                           c1h, c2h,                     &
                           mut, time_step, config_flags, &
                           msfux, msfuy, msfvx, msfvy,   &
@@ -554,8 +635,25 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
 
      ENDIF
      
+   IF( ieva ) THEN
+      
+     CALL advect_s_implicit ( t, t_old, t_tend, ru, rv, wwI,  &
+                              c1h, c2h,                       &
+                              mut_old, mut, mut_new,          &
+                              config_flags,                   &
+                              msfux, msfuy, msfvx, msfvy,     &
+                              msftx, msfty,                   &
+                              fnm, fnp,                       &
+                              dt_step,                        &
+                              rdx, rdy, rdnw,                 &
+                              ids, ide, jds, jde, kds, kde,   &
+                              ims, ime, jms, jme, kms, kme,   &
+                              its, ite, jts, jte, kts, kte )
+
+   ENDIF
+     
      IF ( config_flags%cu_physics == GDSCHEME  .OR.     &
-          config_flags%cu_physics == GFSCHEME  .OR.     &
+        config_flags%cu_physics == GFLSCHEME  .OR.    &
           config_flags%cu_physics == G3SCHEME  .OR.     &
           config_flags%cu_physics == NTIEDTKESCHEME )  THEN     ! NTiedtke
 
@@ -568,7 +666,7 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
 
      END IF
 
-     CALL rhs_ph( ph_tend, u, v, ww, ph, ph, phb, w, &
+   CALL rhs_ph( ph_tend, u, v, wwE, ph, ph, phb, w, &
                   mut, muu, muv,                     &
                   c1f, c2f,                          &
                   fnm, fnp,                          &
@@ -578,9 +676,44 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
                   msftx, msfty,                      &
                   non_hydrostatic,                   &
                   config_flags,                      &
+                ids, ide, jds, jde, kds, kde,      &
+                ims, ime, jms, jme, kms, kme,      &
+                its, ite, jts, jte, kts, kte      )
+
+    IF( ieva ) THEN
+      
+        CALL advect_ph_implicit ( ph, ph_old, ph_tend, phb,       &
+                                  ru, rv, wwE, wwI, w,            & 
+                                  c1f, c2f,                       &
+                                  mut, config_flags,              &
+                                  msfux, msfuy, msfvx, msfvy,     &
+                                  msftx, msfty,                   &
+                                  fnm, fnp,                       &
+                                  dt_step,                        &
+                                  rdx, rdy, rdnw,                 &
+                                  ids, ide, jds, jde, kds, kde,   &
+                                  ims, ime, jms, jme, kms, kme,   &
+                                  its, ite, jts, jte, kts, kte )
+
+     IF (non_hydrostatic) THEN
+      
+       CALL advect_w_implicit ( w, w_old, rw_tend,              &
+                                ru_tend, rv_tend, ht, wwI,      &
+                                ph, ph_old, ph_tend,            &
+                                c1f, c2f, cf1, cf2, cf3,        &
+                                mut_old, mut, mut_new,          &
+                                config_flags,                   &
+                                msfux, msfuy, msfvx, msfvy,     &
+                                msftx, msfty,                   &
+                                fnm, fnp,                       &
+                                dt_step,                        &
+                                rdx, rdy, rdn,                  &
                   ids, ide, jds, jde, kds, kde,      &
                   ims, ime, jms, jme, kms, kme,      &
                   its, ite, jts, jte, kts, kte      )
+     ENDIF
+     
+   ENDIF  ! IEVA
 
      CALL horizontal_pressure_gradient( ru_tend,rv_tend,                 &
                                          ph,alt,p,pb,al,php,cqu,cqv,     &
@@ -649,6 +782,7 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
                        its, ite, jts, jte, kts, kte   )
 
 ! Damping option added for Held-Suarez test (also uses lw option HELDSUAREZ)
+
       IF (config_flags%ra_lw_physics == HELDSUAREZ) THEN
          CALL held_suarez_damp ( ru_tend, rv_tend,               &   
                                  ru,rv,p,pb,                     &
@@ -749,6 +883,11 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
       CALL sixth_order_diffusion( 'u', u, ru_tendf, mut, dt,          &
                                        config_flags, c1h, c2h,        &
                                        diff_6th_opt, diff_6th_factor, &
+                                       phb, ph,                       &
+                                       rdx, rdy,                      &
+                                       msftx, msfty,                  &
+                                       msfux, msfuy,                  &
+                                       msfvx, msfvy,                  &
                                        ids, ide, jds, jde, kds, kde,  &
                                        ims, ime, jms, jme, kms, kme,  &
                                        its, ite, jts, jte, kts, kte )
@@ -756,6 +895,11 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
       CALL sixth_order_diffusion( 'v', v, rv_tendf, mut, dt,          &
                                        config_flags, c1h, c2h,        &
                                        diff_6th_opt, diff_6th_factor, &
+                                       phb, ph,                       &
+                                       rdx, rdy,                      &
+                                       msftx, msfty,                  &
+                                       msfux, msfuy,                  &
+                                       msfvx, msfvy,                  &
                                        ids, ide, jds, jde, kds, kde,  &
                                        ims, ime, jms, jme, kms, kme,  &
                                        its, ite, jts, jte, kts, kte )
@@ -764,6 +908,11 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
       CALL sixth_order_diffusion( 'w', w, rw_tendf, mut, dt,          &
                                        config_flags, c1f, c2f,        &
                                        diff_6th_opt, diff_6th_factor, &
+                                       phb, ph,                       &
+                                       rdx, rdy,                      &
+                                       msftx, msfty,                  &
+                                       msfux, msfuy,                  &
+                                       msfvx, msfvy,                  &
                                        ids, ide, jds, jde, kds, kde,  &
                                        ims, ime, jms, jme, kms, kme,  &
                                        its, ite, jts, jte, kts, kte )
@@ -771,6 +920,11 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
       CALL sixth_order_diffusion( 'm', t,  t_tendf, mut, dt,          &
                                        config_flags, c1h, c2h,        &
                                        diff_6th_opt, diff_6th_factor, &
+                                       phb, ph,                       &
+                                       rdx, rdy,                      &
+                                       msftx, msfty,                  &
+                                       msfux, msfuy,                  &
+                                       msfvx, msfvy,                  &
                                        ids, ide, jds, jde, kds, kde,  &
                                        ims, ime, jms, jme, kms, kme,  &
                                        its, ite, jts, jte, kts, kte )
@@ -923,7 +1077,7 @@ SUBROUTINE rk_addtend_dry ( ru_tend, rv_tend, rw_tend, ph_tend, t_tend,      &
      IF(rk_step == 1)t_tendf(i,k,j) = t_tendf(i,k,j) +  t_save(i,k,j)
      ! divide by my to couple theta
       t_tend(i,k,j) =  t_tend(i,k,j) +  t_tendf(i,k,j)/msfty(i,j)  &
-                                     +  mut(i,j)*h_diabatic(i,k,j)/msfty(i,j)
+                                     +  (c1(k)*mut(i,j)+c2(k))*h_diabatic(i,k,j)/msfty(i,j)
      ! divide by my to couple heating
    ENDDO
    ENDDO
@@ -942,9 +1096,11 @@ END SUBROUTINE rk_addtend_dry
 
 SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
                             tenddec,                        & 
-                            rk_step, dt,                     &
-                            ru, rv, ww, mut, mub, mu_old,    &
-                            c1h, c2h, alt,                   &
+                            rk_step, dt_step,                &
+                            ru, rv, ww, wwE, wwI,            &  
+                            u_old, v_old,                    &  
+                            mut, mub, mu_old,                &
+                            c1h, c2h, c1f, c2f, alt,         &
                             scalar_old, scalar,              &
                             scalar_tends, advect_tend,       &
                             h_tendency, z_tendency,          & 
@@ -956,6 +1112,8 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
                             khdif, kvdif, xkmhd,             &
                             diff_6th_opt, diff_6th_factor,   &
                             adv_opt,                         &
+                            phb, ph,                         &
+                            mix2_off, mix6_off,              &
                             ids, ide, jds, jde, kds, kde,    &
                             ims, ime, jms, jme, kms, kme,    &
                             its, ite, jts, jte, kts, kte    )
@@ -989,9 +1147,12 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
    REAL, DIMENSION(ims:ime, kms:kme, jms:jme  ), INTENT(IN   ) ::     ru,  &
                                                                       rv,  &
                                                                       ww,  &
+                                                                      u_old,  &
+                                                                      v_old,  &
                                                                       xkmhd,  &
-                                                                      alt
-
+                                                                      alt,    &
+                                                                      phb,    &
+                                                                      ph
 
    REAL , DIMENSION( kms:kme ) ,                 INTENT(IN   ) :: fnm,  &
                                                                   fnp,  &
@@ -1000,6 +1161,7 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
                                                                   base
 
    REAL , DIMENSION( kms:kme ) ,                 INTENT(IN   ) :: c1h, c2h
+   REAL , DIMENSION( kms:kme ) ,                 INTENT(IN   ) :: c1f, c2f
 
    REAL , DIMENSION( ims:ime , jms:jme ) ,       INTENT(IN   ) :: msfux,    &
                                                                   msfuy,    &
@@ -1020,16 +1182,24 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
    INTEGER, INTENT( IN ) :: diff_6th_opt
    REAL,    INTENT( IN ) :: diff_6th_factor
 
-   REAL ,                                        INTENT(IN   ) :: dt
+   REAL,    INTENT(IN   ) :: dt_step    ! This is the local dt for each RK sub-step
 
    INTEGER, INTENT(IN   ) :: adv_opt          
+   LOGICAL, INTENT(IN   ) :: mix2_off, mix6_off
 
    ! Local data
   
    INTEGER :: im, i,j,k
    INTEGER :: time_step
+   INTEGER :: rk_order
+   REAL    :: dt         ! This is the large time step computed below
 
    REAL    :: khdq, kvdq, tendency
+
+! IEVA variables
+   REAL, DIMENSION( ims:ime, kms:kme, jms:jme ) :: wwE, wwI  
+   REAL, DIMENSION( ims:ime, jms:jme )          :: mut_old  
+   LOGICAL                                      :: ieva
 
 !<DESCRIPTION>
 !
@@ -1038,9 +1208,41 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
 !
 !</DESCRIPTION>
 
-
    khdq = khdif/prandtl
    kvdq = kvdif/prandtl
+
+   rk_order = config_flags%rk_ord
+   dt       = dt_step * (rk_order - rk_step + 1)    ! need large time step
+
+! IEVA
+                         
+   ieva = CHK_IEVA( config_flags, rk_step )
+
+! Code for splitting vertical velocity into ex/im parts
+
+   CALL WW_SPLIT(wwE, wwI,                         &
+                 u_old,   v_old,    ww,            &
+                 mut, rdnw, msfty,                 &
+                 c1f, c2f,                         &
+                 rdx, rdy, msfux, msfuy,           &
+                 msfvx, msfvy, dt,                 &
+                 config_flags, rk_step,            &
+                 ids, ide, jds, jde, kds, kde,     &
+                 ims, ime, jms, jme, kms, kme,     &
+                 its, ite, jts, jte, kts, kte )
+                 
+                 
+   IF( ieva ) THEN
+   
+! Need an estimate of the mut at the original ('n') time level...
+
+    CALL calculate_full( mut_old,  mub, mu_old,     &
+                         ids, ide, jds, jde, 1, 2,  &
+                         ims, ime, jms, jme, 1, 1,  &
+                         its, ite, jts, jte, 1, 1 )
+   ENDIF
+   
+   CALL nl_get_time_step ( 1, time_step )
 
    scalar_loop : DO im = scs, sce
 
@@ -1061,46 +1263,46 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
 
      CALL nl_get_time_step ( 1, time_step )
 
-      IF( (rk_step == 3) .and. (adv_opt == POSITIVEDEF) ) THEN
+      IF( (rk_step == rk_order) .and. (adv_opt == POSITIVEDEF) ) THEN
 
         CALL advect_scalar_pd       ( scalar(ims,kms,jms,im),             &
                                       scalar_old(ims,kms,jms,im),         &
                                       advect_tend(ims,kms,jms),           &
                                       h_tendency(ims,kms,jms),            & 
                                       z_tendency(ims,kms,jms),            & 
-                                      ru, rv, ww, c1h, c2h,               &
+                                      ru, rv, wwE, c1h, c2h,              &
                                       mut, mub, mu_old,                   &
                                       time_step, config_flags, tenddec,   & 
                                       msfux, msfuy, msfvx, msfvy,         &
                                       msftx, msfty, fnm, fnp,             &
-                                      rdx, rdy, rdnw,dt,                  &
+                                      rdx, rdy, rdnw, dt_step,            &  
                                       ids, ide, jds, jde, kds, kde,       &
                                       ims, ime, jms, jme, kms, kme,       &
                                       its, ite, jts, jte, kts, kte     )
 
-      ELSE IF( (rk_step == 3) .and. (adv_opt == MONOTONIC) ) THEN
+      ELSE IF( (rk_step == rk_order) .and. (adv_opt == MONOTONIC) ) THEN
 
         CALL advect_scalar_mono       ( scalar(ims,kms,jms,im),             &
                                         scalar_old(ims,kms,jms,im),         &
                                         advect_tend(ims,kms,jms),           &
                                         h_tendency(ims,kms,jms),            & 
                                         z_tendency(ims,kms,jms),            & 
-                                        ru, rv, ww, c1h, c2h,               &
+                                        ru, rv, wwE, wwI, c1h, c2h,         &
                                         mut, mub, mu_old,                   &
                                         config_flags, tenddec,              & 
                                         msfux, msfuy, msfvx, msfvy,         &
                                         msftx, msfty, fnm, fnp,             &
-                                        rdx, rdy, rdnw,dt,                  &
+                                        rdx, rdy, rdnw, dt_step,            &
                                         ids, ide, jds, jde, kds, kde,       &
                                         ims, ime, jms, jme, kms, kme,       &
                                         its, ite, jts, jte, kts, kte     )
 
-      ELSE IF( (rk_step == 3) .and. (adv_opt == WENO_SCALAR) ) THEN
+      ELSE IF( (rk_step == rk_order) .and. (adv_opt == WENO_SCALAR) ) THEN
 
         CALL advect_scalar_weno ( scalar(ims,kms,jms,im),        &
                                  scalar(ims,kms,jms,im),        &
                                  advect_tend(ims,kms,jms),      &
-                                 ru, rv, ww, c1h, c2h,          &
+                                  ru, rv, wwE, c1h, c2h,         &
                                  mut, time_step,                &
                                  config_flags,                  &
                                  msfux, msfuy, msfvx, msfvy,    &
@@ -1110,17 +1312,17 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
                                  ims, ime, jms, jme, kms, kme,  &
                                  its, ite, jts, jte, kts, kte  )
 
-      ELSEIF( (rk_step == 3) .and. (adv_opt == WENOPD_SCALAR) ) THEN
+      ELSEIF( (rk_step == rk_order) .and. (adv_opt == WENOPD_SCALAR) ) THEN
 
         CALL advect_scalar_wenopd   ( scalar(ims,kms,jms,im),             &
                                       scalar_old(ims,kms,jms,im),         &
                                       advect_tend(ims,kms,jms),           &
-                                      ru, rv, ww, c1h, c2h,               &
+                                      ru, rv, wwE, c1h, c2h,              &
                                       mut, mub, mu_old,                   &
                                       time_step, config_flags,            &
                                       msfux, msfuy, msfvx, msfvy,         &
                                       msftx, msfty, fnm, fnp,             &
-                                      rdx, rdy, rdnw,dt,                  &
+                                      rdx, rdy, rdnw, dt_step,            &  ! dt_step == dt
                                       ids, ide, jds, jde, kds, kde,       &
                                       ims, ime, jms, jme, kms, kme,       &
                                       its, ite, jts, jte, kts, kte     )
@@ -1130,7 +1332,7 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
         CALL advect_scalar     ( scalar(ims,kms,jms,im),        &
                                  scalar(ims,kms,jms,im),        &
                                  advect_tend(ims,kms,jms),      &
-                                 ru, rv, ww, c1h, c2h,          &
+                                 ru, rv, wwE, c1h, c2h,         &
                                  mut, time_step,                &
                                  config_flags,                  &
                                  msfux, msfuy, msfvx, msfvy,    &
@@ -1142,8 +1344,28 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
 
       END IF
 
+      IF( ieva ) THEN
+     
+       CALL advect_s_implicit ( scalar(ims,kms,jms,im),         &
+                                scalar_old(ims,kms,jms,im),     &
+                                advect_tend(ims,kms,jms),       &
+                                ru, rv, wwI,                    &
+                                c1h, c2h,                       &
+                                mut_old, mut, mut,              &
+                                config_flags,                   &
+                                msfux, msfuy, msfvx, msfvy,     &
+                                msftx, msfty,                   &
+                                fnm, fnp,                       &
+                                dt_step,                        &
+                                rdx, rdy, rdnw,                 &
+                                ids, ide, jds, jde, kds, kde,   &
+                                ims, ime, jms, jme, kms, kme,   &
+                                its, ite, jts, jte, kts, kte )
+                               
+     ENDIF
+    
      IF((config_flags%cu_physics == GDSCHEME .OR. config_flags%cu_physics == G3SCHEME .OR. &
-         config_flags%cu_physics == GFSCHEME .OR.    & 
+         config_flags%cu_physics == GFLSCHEME .OR.    &
          config_flags%cu_physics == KFETASCHEME .OR. config_flags%cu_physics == MSKFSCHEME .OR. &
          config_flags%cu_physics == TIEDTKESCHEME .OR. config_flags%cu_physics == NTIEDTKESCHEME  ) &      ! Tiedtke
                      .and. moist_step .and. ( im == P_QV) ) THEN
@@ -1158,6 +1380,7 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
 
        diff_opt1 : IF (config_flags%diff_opt .eq. 1) THEN
 
+         IF (.not. mix2_off)                                                   &
        CALL horizontal_diffusion ( 'm', scalar(ims,kms,jms,im),            &
                                         scalar_tends(ims,kms,jms,im), mut, &
                                         c1h, c2h, config_flags,            &
@@ -1196,14 +1419,22 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
 
     ENDIF diff_opt1
 
-    IF ( diff_6th_opt .NE. 0 )                                        &
+       IF ( (diff_6th_opt .NE. 0) .and. (.not. mix6_off) ) THEN
+
       CALL sixth_order_diffusion( 'm', scalar(ims,kms,jms,im),        &
                                        scalar_tends(ims,kms,jms,im),  &
-                                       mut, dt, config_flags, c1h,c2h,&
+                                          mut, dt_step,                  &
+                                          config_flags, c1h, c2h,        &
                                        diff_6th_opt, diff_6th_factor, &
+                                          phb, ph,                       &
+                                          rdx, rdy,                      &
+                                          msftx, msfty,                  &
+                                          msfux, msfuy,                  &
+                                          msfvx, msfvy,                  &
                                        ids, ide, jds, jde, kds, kde,  &
                                        ims, ime, jms, jme, kms, kme,  &
                                        its, ite, jts, jte, kts, kte )
+       ENDIF
 
   ENDIF rk_step_1
 
@@ -1263,7 +1494,7 @@ SUBROUTINE q_diabatic_add ( scs, sce,                        &
        DO j = jts,MIN(jte,jde-1)
        DO k = kts,kte-1
        DO i = its,MIN(ite,ide-1)
-         scalar_tends(i,k,j,im) = scalar_tends(i,k,j,im) + qv_diabatic(i,k,j)*mut(I,J)
+         scalar_tends(i,k,j,im) = scalar_tends(i,k,j,im) + qv_diabatic(i,k,j)*(c1(k)*mut(I,J)+c2(k))
        ENDDO
        ENDDO
        ENDDO
@@ -1273,7 +1504,7 @@ SUBROUTINE q_diabatic_add ( scs, sce,                        &
        DO j = jts,MIN(jte,jde-1)
        DO k = kts,kte-1
        DO i = its,MIN(ite,ide-1)
-         scalar_tends(i,k,j,im) = scalar_tends(i,k,j,im) + qc_diabatic(i,k,j)*mut(I,J)
+         scalar_tends(i,k,j,im) = scalar_tends(i,k,j,im) + qc_diabatic(i,k,j)*(c1(k)*mut(I,J)+c2(k))
        ENDDO
        ENDDO
        ENDDO
@@ -1490,8 +1721,8 @@ SUBROUTINE rk_update_scalar( scs, sce,                      &
       DO  i = its, min(ite,ide-1)
 
         scalar_1(i,k,j,im) = scalar_2(i,k,j,im)
-        scalar_2(i,k,j,im) = (muold(i)*scalar_1(i,k,j,im)   &
-                             + dt*tendency(i,k,j))/munew(i)
+        scalar_2(i,k,j,im) = ((c1(k)*muold(i)+c2(k))*scalar_1(i,k,j,im)   &
+                             + dt*tendency(i,k,j))/(c1(k)*munew(i)+c2(k))
 
       ENDDO
       ENDDO
@@ -1540,8 +1771,8 @@ SUBROUTINE rk_update_scalar( scs, sce,                      &
       DO  k = kts, min(kte,kde-1)
       DO  i = its, min(ite,ide-1)
 
-        scalar_2(i,k,j,im) = (muold(i)*scalar_1(i,k,j,im)   &
-                             + dt*tendency(i,k,j))/munew(i)
+        scalar_2(i,k,j,im) = ((c1(k)*muold(i)+c2(k))*scalar_1(i,k,j,im)   &
+                             + dt*tendency(i,k,j))/(c1(k)*munew(i)+c2(k))
 
       ENDDO
       ENDDO
@@ -1552,8 +1783,8 @@ SUBROUTINE rk_update_scalar( scs, sce,                      &
           DO  k = kts, min(kte,kde-1)
           DO  i = its, min(ite,ide-1)
 
-            advh_t(i,k,j) = advh_t(i,k,j) + (dt*h_tendency(i,k,j)* msfty(i,j))/munew(i)
-            advz_t(i,k,j) = advz_t(i,k,j) + (dt*z_tendency(i,k,j)* msfty(i,j))/munew(i)
+            advh_t(i,k,j) = advh_t(i,k,j) + (dt*h_tendency(i,k,j)* msfty(i,j))/(c1(k)*munew(i)+c2(k))
+            advz_t(i,k,j) = advz_t(i,k,j) + (dt*z_tendency(i,k,j)* msfty(i,j))/(c1(k)*munew(i)+c2(k))
 
           ENDDO
           ENDDO
@@ -1675,8 +1906,8 @@ SUBROUTINE rk_update_scalar_pd( scs, sce,                      &
       DO  k = kts, min(kte,kde-1)
       DO  i = its, min(ite,ide-1)
 
-        scalar(i,k,j,im) = (muold(i)*scalar(i,k,j,im)   &
-                             + dt*tendency(i,k,j))/munew(i)
+        scalar(i,k,j,im) = ((c1(k)*muold(i)+c2(k))*scalar(i,k,j,im)   &
+                             + dt*tendency(i,k,j))/(c1(k)*munew(i)+c2(k))
       ENDDO
       ENDDO
       ENDDO
@@ -1861,6 +2092,14 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
                      RQISHTEN,RQSSHTEN,RQGSHTEN,                       &
                      RUNDGDTEN,RVNDGDTEN,RTHNDGDTEN,RQVNDGDTEN,        &
                      RMUNDGDTEN,                                       &
+                     ruiauten,rviauten,rthiauten,                      &
+                     rqviauten,rqciauten,rqriauten,                    &
+                     rqiiauten,rqsiauten,rqgiauten,                    &
+                     rmuiauten,rphiauten,                              &
+                     u_iau,v_iau,t_iau,ph_iau,                         &
+                     mu_iau,qv_iau,qc_iau,qr_iau,                      &
+                     qi_iau,qs_iau,qg_iau,                             &
+                     itimestep,                                        &
                      scalar, scalar_tend, num_scalar,                  &
                      tracer, tracer_tend, num_tracer,                  &
                      ids,ide, jds,jde, kds,kde,                        &
@@ -1940,6 +2179,38 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
       REAL,     DIMENSION( ims:ime, jms:jme )               , &
                 INTENT(INOUT)   ::                           RMUNDGDTEN
 
+! iau
+      REAL,     DIMENSION( ims:ime , kms:kme , jms:jme ),              &
+                INTENT(INOUT)   ::                           RUIAUTEN, &
+                                                             RVIAUTEN, &
+                                                            RTHIAUTEN, &
+                                                            RPHIAUTEN, &
+                                                            RQVIAUTEN, &
+                                                            RQCIAUTEN, &
+                                                            RQRIAUTEN, &
+                                                            RQIIAUTEN, &
+                                                            RQSIAUTEN, &
+                                                            RQGIAUTEN   
+
+      REAL,     DIMENSION( ims:ime, jms:jme ),                         &
+                INTENT(INOUT)   ::                          RMUIAUTEN
+
+      REAL,     DIMENSION( ims:ime , kms:kme , jms:jme ),              &
+                INTENT(IN   )   ::                                     &
+                                                                u_iau, &
+                                                                v_iau, &
+                                                                t_iau, &
+                                                               ph_iau, &
+                                                               qv_iau, &
+                                                               qc_iau, &
+                                                               qr_iau, &
+                                                               qs_iau, &
+                                                               qi_iau, &
+                                                               qg_iau   
+
+      REAL,     DIMENSION( ims:ime, jms:jme ),                         &
+                INTENT(IN   )   ::                             mu_iau
+
 ! 4d arrays
 
     REAL    ,DIMENSION(ims:ime,kms:kme,jms:jme,num_tracer),INTENT(INOUT)   :: tracer
@@ -1947,8 +2218,12 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
     REAL    ,DIMENSION(ims:ime,kms:kme,jms:jme,num_scalar),INTENT(INOUT)   :: scalar
     REAL    ,DIMENSION(ims:ime,kms:kme,jms:jme,num_scalar),INTENT(INOUT)   :: scalar_tend
 
+      INTEGER :: itimestep
       INTEGER :: i,k,j, im
       INTEGER :: itf,ktf,jtf,itsu,jtsv
+
+! local
+    real   :: wgt_iau
 
 !-----------------------------------------------------------------------
 
@@ -1973,7 +2248,7 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
       DO J=jts,jtf
       DO K=kts,ktf
       DO I=its,itf
-         RTHRATEN(I,K,J)=mut(I,J)*RTHRATEN(I,K,J)
+         RTHRATEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RTHRATEN(I,K,J)
       ENDDO
       ENDDO
       ENDDO
@@ -1985,21 +2260,21 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
    IF (config_flags%cu_physics .gt. 0) THEN
 
       DO J=jts,jtf
-      DO I=its,itf
       DO K=kts,ktf
-         RUCUTEN(I,K,J) =mut(I,J)*RUCUTEN(I,K,J)
-         RVCUTEN(I,K,J) =mut(I,J)*RVCUTEN(I,K,J)
-         RTHCUTEN(I,K,J)=mut(I,J)*RTHCUTEN(I,K,J)
-         RQVCUTEN(I,K,J)=mut(I,J)*RQVCUTEN(I,K,J)
+      DO I=its,itf
+         RUCUTEN(I,K,J) =(c1(k)*mut(I,J)+c2(k))*RUCUTEN(I,K,J)
+         RVCUTEN(I,K,J) =(c1(k)*mut(I,J)+c2(k))*RVCUTEN(I,K,J)
+         RTHCUTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RTHCUTEN(I,K,J)
+         RQVCUTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RQVCUTEN(I,K,J)
       ENDDO
       ENDDO
       ENDDO
 
       IF (P_QC .ge. PARAM_FIRST_SCALAR)THEN
          DO J=jts,jtf
-         DO I=its,itf
          DO K=kts,ktf
-            RQCCUTEN(I,K,J)=mut(I,J)*RQCCUTEN(I,K,J)
+         DO I=its,itf
+            RQCCUTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RQCCUTEN(I,K,J)
          ENDDO
          ENDDO
          ENDDO
@@ -2007,9 +2282,9 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
 
       IF (P_QR .ge. PARAM_FIRST_SCALAR)THEN
          DO J=jts,jtf
-         DO I=its,itf
          DO K=kts,ktf
-            RQRCUTEN(I,K,J)=mut(I,J)*RQRCUTEN(I,K,J)
+         DO I=its,itf
+            RQRCUTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RQRCUTEN(I,K,J)
          ENDDO
          ENDDO
          ENDDO
@@ -2017,9 +2292,9 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
 
       IF (P_QI .ge. PARAM_FIRST_SCALAR)THEN
          DO J=jts,jtf
-         DO I=its,itf
          DO K=kts,ktf
-            RQICUTEN(I,K,J)=mut(I,J)*RQICUTEN(I,K,J)
+         DO I=its,itf
+            RQICUTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RQICUTEN(I,K,J)
          ENDDO
          ENDDO
          ENDDO
@@ -2027,9 +2302,9 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
 
       IF(P_QS .ge. PARAM_FIRST_SCALAR)THEN
          DO J=jts,jtf
-         DO I=its,itf
          DO K=kts,ktf
-            RQSCUTEN(I,K,J)=mut(I,J)*RQSCUTEN(I,K,J)
+         DO I=its,itf
+            RQSCUTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RQSCUTEN(I,K,J)
          ENDDO
          ENDDO
          ENDDO
@@ -2042,21 +2317,21 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
    IF (config_flags%shcu_physics .gt. 0) THEN
 
       DO J=jts,jtf
-      DO I=its,itf
       DO K=kts,ktf
-         RUSHTEN(I,K,J) =mut(I,J)*RUSHTEN(I,K,J)
-         RVSHTEN(I,K,J) =mut(I,J)*RVSHTEN(I,K,J)
-         RTHSHTEN(I,K,J)=mut(I,J)*RTHSHTEN(I,K,J)
-         RQVSHTEN(I,K,J)=mut(I,J)*RQVSHTEN(I,K,J)
+      DO I=its,itf
+         RUSHTEN(I,K,J) =(c1(k)*mut(I,J)+c2(k))*RUSHTEN(I,K,J)
+         RVSHTEN(I,K,J) =(c1(k)*mut(I,J)+c2(k))*RVSHTEN(I,K,J)
+         RTHSHTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RTHSHTEN(I,K,J)
+         RQVSHTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RQVSHTEN(I,K,J)
       ENDDO
       ENDDO
       ENDDO
 
       IF (P_QC .ge. PARAM_FIRST_SCALAR)THEN
          DO J=jts,jtf
-         DO I=its,itf
          DO K=kts,ktf
-            RQCSHTEN(I,K,J)=mut(I,J)*RQCSHTEN(I,K,J)
+         DO I=its,itf
+            RQCSHTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RQCSHTEN(I,K,J)
          ENDDO
          ENDDO
          ENDDO
@@ -2064,9 +2339,9 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
 
       IF (P_QR .ge. PARAM_FIRST_SCALAR)THEN
          DO J=jts,jtf
-         DO I=its,itf
          DO K=kts,ktf
-            RQRSHTEN(I,K,J)=mut(I,J)*RQRSHTEN(I,K,J)
+         DO I=its,itf
+            RQRSHTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RQRSHTEN(I,K,J)
          ENDDO
          ENDDO
          ENDDO
@@ -2074,9 +2349,9 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
 
       IF (P_QI .ge. PARAM_FIRST_SCALAR)THEN
          DO J=jts,jtf
-         DO I=its,itf
          DO K=kts,ktf
-            RQISHTEN(I,K,J)=mut(I,J)*RQISHTEN(I,K,J)
+         DO I=its,itf
+            RQISHTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RQISHTEN(I,K,J)
          ENDDO
          ENDDO
          ENDDO
@@ -2084,9 +2359,9 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
 
       IF(P_QS .ge. PARAM_FIRST_SCALAR)THEN
          DO J=jts,jtf
-         DO I=its,itf
          DO K=kts,ktf
-            RQSSHTEN(I,K,J)=mut(I,J)*RQSSHTEN(I,K,J)
+         DO I=its,itf
+            RQSSHTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RQSSHTEN(I,K,J)
          ENDDO
          ENDDO
          ENDDO
@@ -2094,9 +2369,9 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
 
       IF(P_QG .ge. PARAM_FIRST_SCALAR)THEN
          DO J=jts,jtf
-         DO I=its,itf
          DO K=kts,ktf
-            RQGSHTEN(I,K,J)=mut(I,J)*RQGSHTEN(I,K,J)
+         DO I=its,itf
+            RQGSHTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RQGSHTEN(I,K,J)
          ENDDO
          ENDDO
          ENDDO
@@ -2111,9 +2386,9 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
       DO J=jts,jtf
       DO K=kts,ktf
       DO I=its,itf
-         RUBLTEN(I,K,J) =mut(I,J)*RUBLTEN(I,K,J)
-         RVBLTEN(I,K,J) =mut(I,J)*RVBLTEN(I,K,J)
-         RTHBLTEN(I,K,J)=mut(I,J)*RTHBLTEN(I,K,J)
+         RUBLTEN(I,K,J) =(c1(k)*mut(I,J)+c2(k))*RUBLTEN(I,K,J)
+         RVBLTEN(I,K,J) =(c1(k)*mut(I,J)+c2(k))*RVBLTEN(I,K,J)
+         RTHBLTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RTHBLTEN(I,K,J)
       ENDDO
       ENDDO
       ENDDO
@@ -2122,7 +2397,7 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
          DO J=jts,jtf
          DO K=kts,ktf
          DO I=its,itf
-            RQVBLTEN(I,K,J)=mut(I,J)*RQVBLTEN(I,K,J)
+            RQVBLTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RQVBLTEN(I,K,J)
          ENDDO
          ENDDO
          ENDDO
@@ -2132,7 +2407,7 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
          DO J=jts,jtf
          DO K=kts,ktf
          DO I=its,itf
-           RQCBLTEN(I,K,J)=mut(I,J)*RQCBLTEN(I,K,J)
+           RQCBLTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RQCBLTEN(I,K,J)
          ENDDO
          ENDDO
          ENDDO
@@ -2142,7 +2417,7 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
          DO J=jts,jtf
          DO K=kts,ktf
          DO I=its,itf
-            RQIBLTEN(I,K,J)=mut(I,J)*RQIBLTEN(I,K,J)
+            RQIBLTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RQIBLTEN(I,K,J)
          ENDDO
          ENDDO
          ENDDO
@@ -2153,9 +2428,9 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
          DO J=jts,jtf
          DO K=kts,ktf
          DO I=its,itf
-            RHDO_QVBLTEN(I,K,J)=mut(I,J)*RHDO_QVBLTEN(I,K,J)
-            RHDO_QCBLTEN(I,K,J)=mut(I,J)*RHDO_QCBLTEN(I,K,J)
-            RHDO_QIBLTEN(I,K,J)=mut(I,J)*RHDO_QIBLTEN(I,K,J)
+            RHDO_QVBLTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RHDO_QVBLTEN(I,K,J)
+            RHDO_QCBLTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RHDO_QCBLTEN(I,K,J)
+            RHDO_QIBLTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RHDO_QIBLTEN(I,K,J)
          ENDDO
          ENDDO
          ENDDO
@@ -2166,9 +2441,9 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
          DO J=jts,jtf
          DO K=kts,ktf
          DO I=its,itf
-            RO18_QVBLTEN(I,K,J)=mut(I,J)*RO18_QVBLTEN(I,K,J)
-            RO18_QCBLTEN(I,K,J)=mut(I,J)*RO18_QCBLTEN(I,K,J)
-            RO18_QIBLTEN(I,K,J)=mut(I,J)*RO18_QIBLTEN(I,K,J)
+            RO18_QVBLTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RO18_QVBLTEN(I,K,J)
+            RO18_QCBLTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RO18_QCBLTEN(I,K,J)
+            RO18_QIBLTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RO18_QIBLTEN(I,K,J)
          ENDDO
          ENDDO
          ENDDO
@@ -2187,9 +2462,9 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
       DO I=itsu,itf
 !     if( i == itf/2 .AND. j == jtf/2 .AND. k == ktf/2 ) &
 !     write(*,'(a,3i6,e15.5)') 'u_ten before=',i,k,j, RUNDGDTEN(i,k,j)
-         RUNDGDTEN(I,K,J) =muu(I,J)*RUNDGDTEN(I,K,J)
+         RUNDGDTEN(I,K,J) =(c1(k)*muu(I,J)+c2(k))*RUNDGDTEN(I,K,J)
 !        if( i == itf/2 .AND. j == jtf/2 .AND. k==ktf/2 ) &
-!          write(*,'(a,2f15.5)') 'mu, muu=',mut(I,J), muu(i,j)
+!          write(*,'(a,2f15.5)') 'mu, muu=',(c1(k)*mut(I,J)+c2(k)), (c1(k)*muu(i,j)+c2(k))
 !     if( i == itf/2 .AND. j == jtf/2 .AND. k == ktf/2 ) &
 !     write(*,'(a,3i6,e15.5)') 'u_ten after=',i,k,j, RUNDGDTEN(i,k,j)
 !     if( RUNDGDTEN(i,k,j) > 30.0 ) write(*,*) 'IKJ=',i,k,j
@@ -2200,7 +2475,7 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
       DO J=jtsv,jtf
       DO K=kts,ktf
       DO I=its,itf
-         RVNDGDTEN(I,K,J) =muv(I,J)*RVNDGDTEN(I,K,J)
+         RVNDGDTEN(I,K,J) =(c1(k)*muv(I,J)+c2(k))*RVNDGDTEN(I,K,J)
       ENDDO
       ENDDO
       ENDDO
@@ -2209,7 +2484,7 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
       DO I=its,itf
 !     if( i == itf/2 .AND. j == jtf/2 .AND. k == ktf/2 ) &
 !     write(*,'(a,3i6,e15.5)') 'th before=',i,k,j, RTHNDGDTEN(I,K,J)
-         RTHNDGDTEN(I,K,J)=mut(I,J)*RTHNDGDTEN(I,K,J)
+         RTHNDGDTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RTHNDGDTEN(I,K,J)
 !        RMUNDGDTEN(I,J) - no coupling
 !     if( i == itf/2 .AND. j == jtf/2 .AND. k == ktf/2 ) &
 !     write(*,'(a,3i6,e15.5)') 'th after=',i,k,j, RTHNDGDTEN(I,K,J)
@@ -2221,7 +2496,7 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
          DO J=jts,jtf
          DO K=kts,ktf
          DO I=its,itf
-            RQVNDGDTEN(I,K,J)=mut(I,J)*RQVNDGDTEN(I,K,J)
+            RQVNDGDTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*RQVNDGDTEN(I,K,J)
          ENDDO
          ENDDO
          ENDDO
@@ -2235,7 +2510,7 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
          DO J=jts,jtf
          DO K=kts,ktf
          DO I=its,itf
-            scalar_tend(I,K,J,im)=mut(I,J)*scalar_tend(I,K,J,im)
+            scalar_tend(I,K,J,im)=(c1(k)*mut(I,J)+c2(k))*scalar_tend(I,K,J,im)
          ENDDO
          ENDDO
          ENDDO
@@ -2245,12 +2520,94 @@ SUBROUTINE calculate_phy_tend (config_flags,c1,c2,                     &
          DO J=jts,jtf
          DO K=kts,ktf
          DO I=its,itf
-            tracer_tend(I,K,J,im)=mut(I,J)*tracer_tend(I,K,J,im)
+            tracer_tend(I,K,J,im)=(c1(k)*mut(I,J)+c2(k))*tracer_tend(I,K,J,im)
          ENDDO
          ENDDO
          ENDDO
    ENDDO
 
+! IAU (Incremental Analysis Updates)
+
+   IF (config_flags%iau .gt. 0) THEN
+
+      wgt_iau = iau_coef(config_flags%iau_time_window_sec,config_flags%dt,itimestep)
+
+      DO J=jts,jtf
+      DO K=kts,ktf
+      DO I=its,itf
+         RUIAUTEN(I,K,J) =(c1(k)*mut(I,J)+c2(k))*U_IAU(I,K,J)*WGT_IAU
+         RVIAUTEN(I,K,J) =(c1(k)*mut(I,J)+c2(k))*V_IAU(I,K,J)*WGT_IAU
+         RTHIAUTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*T_IAU(I,K,J)*WGT_IAU
+         RQVIAUTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*QV_IAU(I,K,J)*WGT_IAU
+      ENDDO
+      ENDDO
+      ENDDO
+
+      DO J=jts,jtf
+      DO K=kts,ktf+1
+      DO I=its,itf
+         RPHIAUTEN(I,K,J)=PH_IAU(I,K,J)*WGT_IAU
+      ENDDO 
+      ENDDO
+      ENDDO
+
+      DO J=jts,jtf
+      DO I=its,itf
+         RMUIAUTEN(I,J) =MU_IAU(I,J)*WGT_IAU
+      ENDDO
+      ENDDO
+
+      IF (P_QC .ge. PARAM_FIRST_SCALAR)THEN
+         DO J=jts,jtf
+         DO K=kts,ktf
+         DO I=its,itf
+            RQCIAUTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*QC_IAU(I,K,J)*WGT_IAU
+         ENDDO
+         ENDDO
+         ENDDO
+      ENDIF
+
+      IF (P_QR .ge. PARAM_FIRST_SCALAR)THEN
+         DO J=jts,jtf
+         DO K=kts,ktf
+         DO I=its,itf
+            RQRIAUTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*QR_IAU(I,K,J)*WGT_IAU
+         ENDDO
+         ENDDO
+         ENDDO
+      ENDIF
+
+      IF (P_QI .ge. PARAM_FIRST_SCALAR)THEN
+         DO J=jts,jtf
+         DO K=kts,ktf
+         DO I=its,itf
+            RQIIAUTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*QI_IAU(I,K,J)*WGT_IAU
+         ENDDO
+         ENDDO
+         ENDDO
+      ENDIF
+
+      IF(P_QS .ge. PARAM_FIRST_SCALAR)THEN
+         DO J=jts,jtf
+         DO K=kts,ktf
+         DO I=its,itf
+            RQSIAUTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*QS_IAU(I,K,J)*WGT_IAU
+         ENDDO
+         ENDDO
+         ENDDO
+      ENDIF
+
+      IF(P_QG .ge. PARAM_FIRST_SCALAR)THEN
+         DO J=jts,jtf
+         DO K=kts,ktf
+         DO I=its,itf
+            RQGIAUTEN(I,K,J)=(c1(k)*mut(I,J)+c2(k))*QG_IAU(I,K,J)*WGT_IAU
+         ENDDO
+         ENDDO
+         ENDDO
+      ENDIF
+
+   ENDIF
 
 END SUBROUTINE calculate_phy_tend
 
@@ -2321,6 +2678,39 @@ SUBROUTINE bound_tke ( tke, tke_upper_bound,       &
   ENDDO
 
   END SUBROUTINE bound_tke
+
+!-----------------------------------------------------------------------
+
+SUBROUTINE bound_qna ( qna,                        &
+                       ids,ide, jds,jde, kds,kde,  &
+                       ims,ime, jms,jme, kms,kme,  &
+                       its,ite, jts,jte, kts,kte  )
+
+  IMPLICIT NONE
+
+  INTEGER,  INTENT(IN   )   ::          ids,ide, jds,jde, kds,kde, &
+                                        ims,ime, jms,jme, kms,kme, &
+                                        its,ite, jts,jte, kts,kte
+
+  REAL, DIMENSION( ims:ime , kms:kme , jms:jme  ), INTENT(INOUT) :: qna
+
+  INTEGER :: i,k,j
+
+!<DESCRIPTION>
+!
+! bounds aerosol between zero and current value
+!
+!</DESCRIPTION>
+
+  DO j=jts,min(jte,jde-1)
+  DO k=kts,kte-1
+  DO i=its,min(ite,ide-1)
+    qna(i,k,j) = max(qna(i,k,j),0.)
+  ENDDO
+  ENDDO
+  ENDDO
+
+  END SUBROUTINE bound_qna
 
 !----------------------------------------------------------------------------------
 !cyl: Implement the forward Lagrangian trajectory calculation in WRF 
@@ -2430,11 +2820,11 @@ subroutine trajectory (     grid,config_flags,               &
    i_end = min( ite+2,ide-1 )
    do j=max(1,jts-1),min(jte+2,jde-1)
      do k=kms,kme-1
-       u(its:i_end,k,j)=ru_m(its:i_end,k,j)/MUU(its:i_end,j)*msfu(its:i_end,j)
-       v(its:i_end,k,j)=rv_m(its:i_end,k,j)/MUV(its:i_end,j)*msfv(its:i_end,j)
+       u(its:i_end,k,j)=ru_m(its:i_end,k,j)/(c1h(k)*MUU(its:i_end,j)+c2h(k))*msfu(its:i_end,j)
+       v(its:i_end,k,j)=rv_m(its:i_end,k,j)/(c1h(k)*MUV(its:i_end,j)+c2h(k))*msfv(its:i_end,j)
      enddo
      do k=kms,kme
-       w(its:i_end,k,j)=ww_m(its:i_end,k,j)/MUT(its:i_end,j)*msft(its:i_end,j)
+       w(its:i_end,k,j)=ww_m(its:i_end,k,j)/(c1f(k)*MUT(its:i_end,j)+c2f(k))*msft(its:i_end,j)
      enddo
    enddo
           has_proj_map  = &
@@ -2787,5 +3177,23 @@ subroutine trajmapproj (grid,config_flags,ts_proj)
 
 
 end subroutine trajmapproj
+
+FUNCTION iau_coef (iau_time_window_sec, dt, itimestep)  result(wgt_iau)
+
+  implicit none
+
+! This function returns the coeficient for IAU
+
+      INTEGER :: itimestep
+      INTEGER :: nsteps_iau
+      REAL    :: wgt_iau, iau_time_window_sec, dt
+
+      wgt_iau = 0.
+      nsteps_iau = nint(iau_time_window_sec / dt)
+      if (itimestep <= nsteps_iau) then
+         wgt_iau = 1.0/iau_time_window_sec
+      endif
+
+END FUNCTION iau_coef
 
 END MODULE module_em

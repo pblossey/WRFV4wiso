@@ -176,7 +176,7 @@
 !
       REAL,OPTIONAL,INTENT(IN),DIMENSION(IMS:IME,KMS:KME,JMS:JME)::    &  !BSF
                                                 QV,QCW,QCI,QCS,QCR,QCG    !BSF
-
+!
       REAL,DIMENSION(IMS:IME,JMS:JME),INTENT(OUT) :: PBLH,MIXHT            !PLee (3/07)
 !
       REAL,DIMENSION(IMS:IME,JMS:JME),INTENT(INOUT) :: AKHS,AKMS
@@ -316,7 +316,6 @@
 !----------------------------------------------------------------------
 !BSF  Begin:
       NSPEC=3   !-- T, Q, Cloud water
-
       flQI=.FALSE.
       flQS=.FALSE.
       flQR=.FALSE.
@@ -656,10 +655,16 @@
 !bloss/qfx: Use QFX, the evaporation mass flux from the surface, instead of the latent heat 
 !    flux (ELFLX) so that we do not need to normalize by the latent heat, which depends on
 !    the surface type (ice/liquid/mixed).
+            QFC1=XLV*CHKLOWQ(I,J)*AKHS_DENS
 !  
-            QFC1=CHKLOWQ(I,J)*AKHS_DENS
+            IF(SNOW(I,J)>0..OR.SICE(I,J)>0.5)THEN
+              QFC1=QFC1*RLIVWV
+            ENDIF
 !
             IF(QFC1>0.)THEN
+              QLOW=QK(KTE+1-LLOW) !bloss/wiso: NEED to check if this should be applied to isotopes too
+              QSFC(I,J)=QLOW+ELFLX(I,J)/QFC1
+            ENDIF
               ! add flux to surface value, which provides lower boundary condition in PBL scheme
               QSFC(I,J)=QLOW+QFX(I,J)/QFC1 !bloss/qfx
 
@@ -699,7 +704,6 @@
             EXNSFC=(1.E5/PSFC)**CAPA
             QSFC(I,J)=PQ0SEA/PSFC                                      &
      &         *EXP(A2*(THSK(I,J)-A3*EXNSFC)/(THSK(I,J)-A4*EXNSFC))
-!
           ENDIF
 !
           QZ0 (I,J)=(1.-SEAMASK)*QSFC(I,J)+SEAMASK*QZ0 (I,J)
@@ -717,8 +721,21 @@
 
 !bloss: BCs for theta (index 1 in SPECIES array)
           SZ0(1)=THZ0(I,J)
+          SZ0(2)=QZ0 (I,J)
+          DO NUMS=3,NSPECE
+            SZ0(NUMS)=0.
+          ENDDO
+!
           CLOW(1)=1.
+          CLOW(2)=CHKLOWQ(I,J)
+          DO NUMS=3,NSPECE
+            CLOW(NUMS)=0.
+          ENDDO
+!
           CTS(1)=CT(I,J)
+          DO NUMS=2,NSPECE
+            CTS(NUMS)=0.
+          ENDDO
 
 !bloss: BCs for water vapor
           SZ0(2)=QZ0 (I,J)

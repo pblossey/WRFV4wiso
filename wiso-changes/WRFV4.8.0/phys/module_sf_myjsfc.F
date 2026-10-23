@@ -81,7 +81,7 @@ CONTAINS
      &                 ,CHS,CHS2,CQS2,HFX,QFX,FLX_LH,FLHC,FLQC         &
      &                 ,QGH,CPM,CT                                     &
      &                 ,U10,V10,T02,TH02,TSHLTR,TH10,Q02,QSHLTR,Q10,PSHLTR          &
-     &                 ,P1000mb                                        &
+     &                 ,P1000mb,U10E,V10E                              &
      &                 ,HDO_QV,HDO_QZ0,HDO_QSFC,HDO_QFX,R_HDO_SURF_OCN,R_HDO_SURF_LAND     & !bloss/wiso
      &                 ,O18_QV,O18_QZ0,O18_QSFC,O18_QFX,R_O18_SURF_OCN,R_O18_SURF_LAND     & !bloss/wiso
      &                 ,WISOTOPE                                       & !bloss/wiso
@@ -116,7 +116,8 @@ CONTAINS
       REAL,DIMENSION(IMS:IME,JMS:JME),INTENT(OUT) :: FLX_LH,HFX,PSHLTR &
      &                                              ,QFX,Q10,QSHLTR    &
      &                                              ,TH10,TSHLTR,T02   &
-     &                                              ,U10,V10,TH02,Q02
+     &                                              ,U10,V10,TH02,Q02  &
+     &                                              ,U10E,V10E
 !
       REAL,DIMENSION(IMS:IME,JMS:JME),INTENT(INOUT) :: AKHS,AKMS       &
      &                                                ,PBLH,QSFC
@@ -329,7 +330,6 @@ CONTAINS
           TZ0=THZ0(I,J)*APESFC
        endif
 !
-!
           CALL SFCDIF(NTSD,SEAMASK,THSK(I,J),QSFC(I,J),PSFC            &
      &               ,UZ0(I,J),VZ0(I,J),TZ0,TSK(I,J),THZ0(I,J),QZ0(I,J)         &
      &               ,USTAR(I,J),ZNT(I,J),Z0BASE(I,J),CT(I,J),RMOL(I,J) &
@@ -342,6 +342,7 @@ CONTAINS
      &               ,ZSL,PLOW                                         &
      &               ,U10(I,J),V10(I,J),TSHLTR(I,J),TH10(I,J)          &
      &               ,QSHLTR(I,J),Q10(I,J),PSHLTR(I,J)                 &
+     &               ,U10E(I,J),V10E(I,J)                              &
      &               ,QSFC_OUT                                         & !bloss/wiso
      &               ,IDS,IDE,JDS,JDE,KDS,KDE                          &
      &               ,IMS,IME,JMS,JME,KMS,KME                          &
@@ -528,6 +529,7 @@ CONTAINS
      &                 ,ULOW,VLOW,TLOW,THLOW,THELOW,QLOW,CWMLOW        &
      &                 ,ZSL,PLOW                                       &
      &                 ,U10,V10,TH02,TH10,Q02,Q10,PSHLTR               &
+     &                 ,U10E,V10E                                      &
      &                 ,QS_OUT                                         & !bloss/wiso
      &                 ,IDS,IDE,JDS,JDE,KDS,KDE                        &
      &                 ,IMS,IME,JMS,JME,KMS,KME                        &
@@ -555,7 +557,7 @@ CONTAINS
 !
       REAL,INTENT(OUT) :: CHS,CHS2,CPM,CQS2,CT,FLHC,FLQC,FLX_LH,HFX    &
      &                   ,PSHLTR,Q02,Q10,QFX,QGH,RIB,RLMO              &
-     &                   ,TH02,TH10,U10,V10
+     &                   ,TH02,TH10,U10,V10,U10E,V10E
 !
       REAL,INTENT(INOUT) :: AKHS,AKMS,QZ0,THZ0,USTAR,UZ0,VZ0,Z0,QS
 !
@@ -580,7 +582,7 @@ CONTAINS
 !
       REAL :: AKHS02,AKHS10,AKMS02,AKMS10,EKMS10,QSAT10,QSAT2          &
      &       ,RLNT02,RLNT10,RLNU10,SIMH02,SIMH10,SIMM10,T02,T10        &
-     &       ,TERM1,RLOW,U10E,V10E,WSTAR,XLT02,XLT024,XLT10            &
+     &       ,TERM1,RLOW,WSTAR,XLT02,XLT024,XLT10            &
      &       ,XLT104,XLU10,XLU104,XU10,XU104,ZT02,ZT10,ZTAT02,ZTAT10   &
      &       ,ZTAU,ZTAU10,ZU10,ZUUZ
 !----------------------------------------------------------------------
@@ -1184,8 +1186,8 @@ CONTAINS
 
       ENDIF
 !
-      U10=U10E
-      V10=V10E
+!     U10=U10E
+!     V10=V10E
 !
 !----------------------------------------------------------------------
 !***  SET OTHER WRF DRIVER ARRAYS
@@ -1257,6 +1259,9 @@ CONTAINS
 !     INTEGER :: MPI_INTEGER,MPI_MAX
 !
       REAL :: SM,X,ZETA1,ZETA2,ZRNG1,ZRNG2
+#ifdef AARCH64_X86_CORRECTNESS_FIX
+      DOUBLE PRECISION :: X2
+#endif
 !
       REAL :: PIHF=3.1415926/2.,EPS=1.E-6
 !----------------------------------------------------------------------
@@ -1378,7 +1383,12 @@ CONTAINS
 !----------------------------------------------------------------------
           X=SQRT(SQRT(1.-16.*ZETA1))
 !
+#ifndef AARCH64_X86_CORRECTNESS_FIX
           PSIM1(K)=-2.*LOG((X+1.)/2.)-LOG((X*X+1.)/2.)+2.*ATAN(X)-PIHF
+#else
+          X2 = dble(X)
+          PSIM1(K)=real(-2.d0 * log((X2+1.d0)/2.d0)-log((X2*X2+1.d0)/2.d0)+2.d0*atan(X2)-dble(PIHF))
+#endif
           PSIH1(K)=-2.*LOG((X*X+1.)/2.)
 !
 !----------------------------------------------------------------------
@@ -1415,7 +1425,12 @@ CONTAINS
 !
           X=SQRT(SQRT(1.-16.*ZETA2))
 !
+#ifndef AARCH64_X86_CORRECTNESS_FIX
           PSIM2(K)=-2.*LOG((X+1.)/2.)-LOG((X*X+1.)/2.)+2.*ATAN(X)-PIHF
+#else
+          X2 = dble(X)
+          PSIM2(K)=real(-2.d0*LOG((X2+1.d0)/2.d0)-LOG((X2*X2+1.d0)/2.d0)+2.*ATAN(X2)-dble(PIHF))
+#endif
           PSIH2(K)=-2.*LOG((X*X+1.)/2.)
 !----------------------------------------------------------------------
 !***  STABLE RANGE
